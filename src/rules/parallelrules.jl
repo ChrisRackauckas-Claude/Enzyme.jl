@@ -1,8 +1,28 @@
 
-function runtime_newtask_fwd(world::Val{World}, fn::FT1, dfn::FT2, post::Any, ssize::Int, ::Val{width}) where {FT1, FT2, World, width}
+function runtime_newtask_fwd(
+    fn::FT1,
+    dfn::FT2,
+    post::Any,
+    ssize::Int,
+    runtimeActivity::Val{RuntimeActivity},
+    ::Val{width},
+) where {FT1,FT2,width,RuntimeActivity}
     FT = Core.Typeof(fn)
     ghos = guaranteed_const(FT)
-    forward = thunk(world, (ghos ? Const : Duplicated){FT}, Const, Tuple{}, Val(API.DEM_ForwardMode), Val(width), Val((false,)), #=returnPrimal=#Val(true), #=shadowinit=#Val(false), FFIABI)
+    forward = thunk(
+        Val(0),
+        (ghos ? Const : Duplicated){FT},
+        Const,
+        Tuple{},
+        Val(API.DEM_ForwardMode),
+        Val(Int(width)),
+        Val((false,)),
+        Val(true),
+        Val(false),
+        FFIABI,
+        Val(false),
+        runtimeActivity,
+    ) #=erriffuncwritten=#
     ft = ghos ? Const(fn) : Duplicated(fn, dfn)
     function fclosure()
         res = forward(ft)
@@ -12,11 +32,37 @@ function runtime_newtask_fwd(world::Val{World}, fn::FT1, dfn::FT2, post::Any, ss
     return ccall(:jl_new_task, Ref{Task}, (Any, Any, Int), fclosure, post, ssize)
 end
 
-function runtime_newtask_augfwd(world::Val{World}, fn::FT1, dfn::FT2, post::Any, ssize::Int, ::Val{width}, ::Val{ModifiedBetween}) where {FT1, FT2, World, width, ModifiedBetween}
+struct Return2
+    ret1::Any
+    ret2::Any
+end
+
+function runtime_newtask_augfwd(
+    fn::FT1,
+    dfn::FT2,
+    post::Any,
+    ssize::Int,
+    runtimeActivity::Val{RuntimeActivity},
+    ::Val{width},
+    ::Val{ModifiedBetween},
+) where {FT1,FT2,width,ModifiedBetween,RuntimeActivity}
     # TODO make this AD subcall type stable
     FT = Core.Typeof(fn)
     ghos = guaranteed_const(FT)
-    forward, adjoint = thunk(world, (ghos ? Const : Duplicated){FT}, Const, Tuple{}, Val(API.DEM_ReverseModePrimal), Val(width), Val(ModifiedBetween), #=returnPrimal=#Val(true), #=shadowinit=#Val(false), FFIABI)
+    forward, adjoint = thunk(
+        Val(0),
+        (ghos ? Const : Duplicated){FT},
+        Const,
+        Tuple{},
+        Val(API.DEM_ReverseModePrimal),
+        Val(Int(width)),
+        Val(ModifiedBetween),
+        Val(true),
+        Val(false),
+        FFIABI,
+        Val(false),
+        runtimeActivity,
+    ) #=erriffuncwritten=#
     ft = ghos ? Const(fn) : Duplicated(fn, dfn)
     taperef = Ref{Any}()
 
@@ -39,13 +85,17 @@ function runtime_newtask_augfwd(world::Val{World}, fn::FT1, dfn::FT2, post::Any,
 end
 
 
-function referenceCaller(fn::Ref{Clos}, args...) where Clos
+function referenceCaller(fn::Ref{Clos}, args...) where {Clos}
     fval = fn[]
     fval = fval::Clos
     fval(args...)
 end
 
-function runtime_pfor_fwd(thunk::ThunkTy, ft::FT, threading_args...)::Cvoid where {ThunkTy, FT}
+function runtime_pfor_fwd(
+    thunk::ThunkTy,
+    ft::FT,
+    threading_args...,
+)::Cvoid where {ThunkTy,FT}
     function fwd(tid_args...)
         if length(tid_args) == 0
             thunk(ft)
@@ -57,12 +107,21 @@ function runtime_pfor_fwd(thunk::ThunkTy, ft::FT, threading_args...)::Cvoid wher
     return
 end
 
-function runtime_pfor_augfwd(thunk::ThunkTy, ft::FT, ::Val{AnyJL}, ::Val{byRef}, threading_args...) where {ThunkTy, FT, AnyJL, byRef}
+function runtime_pfor_augfwd(
+    thunk::ThunkTy,
+    ft::FT,
+    ::Val{AnyJL},
+    ::Val{byRef},
+    threading_args...,
+) where {ThunkTy,FT,AnyJL,byRef}
     TapeType = EnzymeRules.tape_type(ThunkTy)
     tapes = if AnyJL
         Vector{TapeType}(undef, Base.Threads.nthreads())
     else
-        Base.unsafe_convert(Ptr{TapeType}, Libc.malloc(sizeof(TapeType)*Base.Threads.nthreads()))
+        Base.unsafe_convert(
+            Ptr{TapeType},
+            Libc.malloc(sizeof(TapeType) * Base.Threads.nthreads()),
+        )
     end
 
     function fwd(tid_args...)
@@ -92,7 +151,14 @@ function runtime_pfor_augfwd(thunk::ThunkTy, ft::FT, ::Val{AnyJL}, ::Val{byRef},
     return tapes
 end
 
-function runtime_pfor_rev(thunk::ThunkTy, ft::FT, ::Val{AnyJL}, ::Val{byRef}, tapes, threading_args...) where {ThunkTy, FT, AnyJL, byRef}
+function runtime_pfor_rev(
+    thunk::ThunkTy,
+    ft::FT,
+    ::Val{AnyJL},
+    ::Val{byRef},
+    tapes,
+    threading_args...,
+) where {ThunkTy,FT,AnyJL,byRef}
     function rev(tid_args...)
         tid = if length(tid_args) == 0
             tid = Base.Threads.threadid()
@@ -128,7 +194,7 @@ function runtime_pfor_rev(thunk::ThunkTy, ft::FT, ::Val{AnyJL}, ::Val{byRef}, ta
     return nothing
 end
 
-@inline function threadsfor_common(orig, gutils, B, mode, tape=nothing)
+@inline function threadsfor_common(orig, gutils, B, mode, tape = nothing)
 
     mod = LLVM.parent(LLVM.parent(LLVM.parent(orig)))
 
@@ -165,13 +231,8 @@ end
 
 
     # TODO actually do modifiedBetween
-@static if VERSION < v"1.8-"
-    e_tt = Tuple{}
-    modifiedBetween = (mode != API.DEM_ForwardMode, )
-else
     e_tt = Tuple{Const{Int}}
     modifiedBetween = (mode != API.DEM_ForwardMode, false)
-end
 
     world = enzyme_extract_world(LLVM.parent(position(B)))
 
@@ -185,25 +246,54 @@ end
     width = get_width(gutils)
 
     ops = collect(operands(orig))[1:end-1]
-    dupClosure = !guaranteed_const_nongen(funcT, world) && !is_constant_value(gutils, ops[1])
+    dupClosure =
+        !guaranteed_const_nongen(funcT, world) && !is_constant_value(gutils, ops[1])
     pdupClosure = dupClosure
 
     subfunc = nothing
     if mode == API.DEM_ForwardMode
         if fwdmodenm === nothing
             etarget = Compiler.EnzymeTarget()
-            eparams = Compiler.EnzymeCompilerParams(Tuple{(dupClosure ? Duplicated : Const){funcT}, e_tt.parameters...}, API.DEM_ForwardMode, width, Const{Nothing}, #=runEnzyme=#true, #=abiwrap=#true, modifiedBetween, #=returnPrimal=#false, #=shadowInit=#false, UnknownTapeType, FFIABI)
-            ejob    = Compiler.CompilerJob(mi2, CompilerConfig(etarget, eparams; kernel=false), world)
+            eparams = Compiler.EnzymeCompilerParams(
+                Tuple{(dupClosure ? Duplicated : Const){funcT},e_tt.parameters...},
+                API.DEM_ForwardMode,
+                width,
+                Const{Nothing},
+                true,
+                true,
+                modifiedBetween,
+                false,
+                false,
+                UnknownTapeType,
+                FFIABI,
+                false,
+                get_runtime_activity(gutils),
+            ) #=ErrIfFuncWritten=#
+            ejob = Compiler.CompilerJob(
+                mi2,
+                CompilerConfig(etarget, eparams; kernel = false),
+                world,
+            )
 
-            cmod, fwdmodenm, _, _ = _thunk(ejob, #=postopt=#false)
-            
+            cmod, fwdmodenm, _, _, _ = _thunk(ejob, false) #=postopt=#
+
             LLVM.link!(mod, cmod)
 
             push!(attributes, StringAttribute("enzymejl_forward", fwdmodenm))
-            push!(function_attributes(functions(mod)[fwdmodenm]), EnumAttribute("alwaysinline"))
+            push!(
+                function_attributes(functions(mod)[fwdmodenm]),
+                EnumAttribute("alwaysinline"),
+            )
             permit_inlining!(functions(mod)[fwdmodenm])
         end
-        thunkTy = ForwardModeThunk{Ptr{Cvoid}, dupClosure ? Duplicated{funcT} : Const{funcT}, Const{Nothing}, e_tt, Val{width},  #=returnPrimal=#Val(false)}
+        thunkTy = ForwardModeThunk{
+            Ptr{Cvoid},
+            dupClosure ? Duplicated{funcT} : Const{funcT},
+            Const{Nothing},
+            e_tt,
+            width,
+            false,
+        }  #=returnPrimal=#
         subfunc = functions(mod)[fwdmodenm]
 
     elseif mode == API.DEM_ReverseModePrimal || mode == API.DEM_ReverseModeGradient
@@ -212,7 +302,7 @@ end
             has_active = ty == MixedState || ty == ActiveState
             if has_active
                 refed = true
-                e_tt = Tuple{Duplicated{Base.RefValue{funcT}}, e_tt.parameters...}
+                e_tt = Tuple{Duplicated{Base.RefValue{funcT}},e_tt.parameters...}
                 funcT = Core.Typeof(referenceCaller)
                 dupClosure = false
                 modifiedBetween = (false, modifiedBetween...)
@@ -223,30 +313,75 @@ end
         if augfwdnm === nothing || adjointnm === nothing
             etarget = Compiler.EnzymeTarget()
             # TODO modifiedBetween
-            eparams = Compiler.EnzymeCompilerParams(Tuple{(dupClosure ? Duplicated : Const){funcT}, e_tt.parameters...}, API.DEM_ReverseModePrimal, width, Const{Nothing}, #=runEnzyme=#true, #=abiwrap=#true, modifiedBetween, #=returnPrimal=#false, #=shadowInit=#false, UnknownTapeType, FFIABI)
-            ejob    = Compiler.CompilerJob(mi2, CompilerConfig(etarget, eparams; kernel=false), world)
+            eparams = Compiler.EnzymeCompilerParams(
+                Tuple{(dupClosure ? Duplicated : Const){funcT},e_tt.parameters...},
+                API.DEM_ReverseModePrimal,
+                width,
+                Const{Nothing},
+                true,
+                true,
+                modifiedBetween,
+                false,
+                false,
+                UnknownTapeType,
+                FFIABI,
+                false,
+                get_runtime_activity(gutils),
+            ) #=ErrIfFuncWritten=#
+            ejob = Compiler.CompilerJob(
+                mi2,
+                CompilerConfig(etarget, eparams; kernel = false),
+                world,
+            )
 
-            cmod, adjointnm, augfwdnm, TapeType = _thunk(ejob, #=postopt=#false)
+            cmod, adjointnm, augfwdnm, TapeType, _ = _thunk(ejob, false) #=postopt=#
 
             LLVM.link!(mod, cmod)
 
             push!(attributes, StringAttribute("enzymejl_augforward", augfwdnm))
-            push!(function_attributes(functions(mod)[augfwdnm]), EnumAttribute("alwaysinline"))
+            push!(
+                function_attributes(functions(mod)[augfwdnm]),
+                EnumAttribute("alwaysinline"),
+            )
             permit_inlining!(functions(mod)[augfwdnm])
 
             push!(attributes, StringAttribute("enzymejl_adjoint", adjointnm))
-            push!(function_attributes(functions(mod)[adjointnm]), EnumAttribute("alwaysinline"))
+            push!(
+                function_attributes(functions(mod)[adjointnm]),
+                EnumAttribute("alwaysinline"),
+            )
             permit_inlining!(functions(mod)[adjointnm])
 
-            push!(attributes, StringAttribute("enzymejl_tapetype", string(convert(UInt, unsafe_to_pointer(TapeType)))))
-            
+            push!(
+                attributes,
+                StringAttribute(
+                    "enzymejl_tapetype",
+                    string(convert(UInt, unsafe_to_pointer(TapeType))),
+                ),
+            )
+
         end
 
         if mode == API.DEM_ReverseModePrimal
-            thunkTy = AugmentedForwardThunk{Ptr{Cvoid}, dupClosure ? Duplicated{funcT} : Const{funcT}, Const{Nothing}, e_tt, Val{width}, #=returnPrimal=#Val(true), TapeType}
+            thunkTy = AugmentedForwardThunk{
+                Ptr{Cvoid},
+                dupClosure ? Duplicated{funcT} : Const{funcT},
+                Const{Nothing},
+                e_tt,
+                width,
+                true,
+                TapeType,
+            } #=returnPrimal=#
             subfunc = functions(mod)[augfwdnm]
-       else
-           thunkTy = AdjointThunk{Ptr{Cvoid}, dupClosure ? Duplicated{funcT} : Const{funcT}, Const{Nothing}, e_tt, Val{width}, TapeType}
+        else
+            thunkTy = AdjointThunk{
+                Ptr{Cvoid},
+                dupClosure ? Duplicated{funcT} : Const{funcT},
+                Const{Nothing},
+                e_tt,
+                width,
+                TapeType,
+            }
             subfunc = functions(mod)[adjointnm]
         end
     else
@@ -254,7 +389,7 @@ end
     end
 
     ppfuncT = pfuncT
-    dpfuncT = width == 1 ? pfuncT : NTuple{(Int)width, pfuncT}
+    dpfuncT = width == 1 ? pfuncT : NTuple{(Int)width,pfuncT}
 
     if refed
         dpfuncT = Base.RefValue{dpfuncT}
@@ -266,7 +401,7 @@ end
         if width == 1
             dfuncT = Duplicated{dfuncT}
         else
-            dfuncT = BatchDuplicated{dfuncT, Int(width)}
+            dfuncT = BatchDuplicated{dfuncT,Int(width)}
         end
     else
         dfuncT = Const{dfuncT}
@@ -276,13 +411,13 @@ end
 
     alloctx = LLVM.IRBuilder()
     position!(alloctx, LLVM.BasicBlock(API.EnzymeGradientUtilsAllocationBlock(gutils)))
-    ll_th =  convert(LLVMType, thunkTy)
+    ll_th = convert(LLVMType, thunkTy)
     al = alloca!(alloctx, ll_th)
     al = addrspacecast!(B, al, LLVM.PointerType(ll_th, Tracked))
     al = addrspacecast!(B, al, LLVM.PointerType(ll_th, Derived))
     push!(vals, al)
 
-    copies = []
+    copies = Tuple{LLVM.Value, LLVM.Value, LLVM.LLVMType}[]
     if !isghostty(dfuncT)
 
         llty = convert(LLVMType, dfuncT)
@@ -304,7 +439,7 @@ end
                 v = load!(B, pllty, v)
             end
         else
-            v = makeInstanceOf(ppfuncT)
+            v = makeInstanceOf(B, ppfuncT)
         end
 
         if refed
@@ -312,7 +447,7 @@ end
             val = bitcast!(B, val, LLVM.PointerType(pllty, addrspace(value_type(val))))
             val = addrspacecast!(B, val, LLVM.PointerType(pllty, Derived))
             store!(B, v, val)
-            if pv !== nothing
+            if !(pv isa Nothing)
                 push!(copies, (pv, val, pllty))
             end
 
@@ -323,7 +458,12 @@ end
             val0 = v
         end
 
-        ptr = inbounds_gep!(B, llty, al, [LLVM.ConstantInt(LLVM.IntType(64), 0), LLVM.ConstantInt(LLVM.IntType(32), 0)])
+        ptr = inbounds_gep!(
+            B,
+            llty,
+            al,
+            [LLVM.ConstantInt(LLVM.IntType(64), 0), LLVM.ConstantInt(LLVM.IntType(32), 0)],
+        )
         store!(B, val0, ptr)
 
         if pdupClosure
@@ -346,7 +486,8 @@ end
 
             if refed
                 dval0 = dval = emit_allocobj!(B, dpfuncT)
-                dval = bitcast!(B, dval, LLVM.PointerType(spllty, addrspace(value_type(dval))))
+                dval =
+                    bitcast!(B, dval, LLVM.PointerType(spllty, addrspace(value_type(dval))))
                 dval = addrspacecast!(B, dval, LLVM.PointerType(spllty, Derived))
                 store!(B, dv, dval)
                 if pv !== nothing
@@ -359,7 +500,15 @@ end
                 dval0 = dv
             end
 
-            dptr = inbounds_gep!(B, llty, al, [LLVM.ConstantInt(LLVM.IntType(64), 0), LLVM.ConstantInt(LLVM.IntType(32), 1)])
+            dptr = inbounds_gep!(
+                B,
+                llty,
+                al,
+                [
+                    LLVM.ConstantInt(LLVM.IntType(64), 0),
+                    LLVM.ConstantInt(LLVM.IntType(32), 1),
+                ],
+            )
             store!(B, dval0, dptr)
         end
 
@@ -372,29 +521,25 @@ end
         push!(vals, tape)
     end
 
-    @static if VERSION < v"1.8-"
-    else
-        push!(vals, new_from_original(gutils, operands(orig)[end-1]))
-    end
+    push!(vals, new_from_original(gutils, operands(orig)[end-1]))
     return refed, LLVM.name(subfunc), dfuncT, vals, thunkTy, TapeType, copies
 end
 
-function threadsfor_fwd(B, orig, gutils, normalR, shadowR)
+@register_fwd function threadsfor_fwd(B, orig, gutils, normalR, shadowR)
     if is_constant_value(gutils, orig) && is_constant_inst(gutils, orig)
         return true
     end
     mod = LLVM.parent(LLVM.parent(LLVM.parent(orig)))
 
-    normal = (unsafe_load(normalR) != C_NULL) ? LLVM.Instruction(unsafe_load(normalR)) : nothing
-    shadow = (unsafe_load(shadowR) != C_NULL) ? LLVM.Instruction(unsafe_load(shadowR)) : nothing
+    normal =
+        (unsafe_load(normalR) != C_NULL) ? LLVM.Instruction(unsafe_load(normalR)) : nothing
+    shadow =
+        (unsafe_load(shadowR) != C_NULL) ? LLVM.Instruction(unsafe_load(shadowR)) : nothing
 
-    _, sname, dfuncT, vals, thunkTy, _, _ = threadsfor_common(orig, gutils, B, API.DEM_ForwardMode)
+    _, sname, dfuncT, vals, thunkTy, _, _ =
+        threadsfor_common(orig, gutils, B, API.DEM_ForwardMode)
 
-@static if VERSION < v"1.8-"
-    tt = Tuple{thunkTy, dfuncT}
-else
-    tt = Tuple{thunkTy, dfuncT, Bool}
-end
+    tt = Tuple{thunkTy,dfuncT,Bool}
     mode = get_mode(gutils)
     world = enzyme_extract_world(LLVM.parent(position(B)))
     entry = nested_codegen!(mode, mod, runtime_pfor_fwd, tt, world)
@@ -417,29 +562,28 @@ end
     return false
 end
 
-function threadsfor_augfwd(B, orig, gutils, normalR, shadowR, tapeR)
+@register_aug function threadsfor_augfwd(B, orig, gutils, normalR, shadowR, tapeR)
     mod = LLVM.parent(LLVM.parent(LLVM.parent(orig)))
 
     if is_constant_value(gutils, orig) && is_constant_inst(gutils, orig)
         return true
     end
 
-    normal = (unsafe_load(normalR) != C_NULL) ? LLVM.Instruction(unsafe_load(normalR)) : nothing
-    shadow = (unsafe_load(shadowR) != C_NULL) ? LLVM.Instruction(unsafe_load(shadowR)) : nothing
+    normal =
+        (unsafe_load(normalR) != C_NULL) ? LLVM.Instruction(unsafe_load(normalR)) : nothing
+    shadow =
+        (unsafe_load(shadowR) != C_NULL) ? LLVM.Instruction(unsafe_load(shadowR)) : nothing
 
-    byRef, sname, dfuncT, vals, thunkTy, _, copies = threadsfor_common(orig, gutils, B, API.DEM_ReverseModePrimal)
+    byRef, sname, dfuncT, vals, thunkTy, _, copies =
+        threadsfor_common(orig, gutils, B, API.DEM_ReverseModePrimal)
 
-@static if VERSION < v"1.8-"
-    if byRef
-        emit_error(B, orig, "Enzyme: active variable in Threads.@threads closure "*(string(eltype(eltype(dfuncT))))*" not supported")
-    end
-end
-
-@static if VERSION < v"1.8-"
-    tt = Tuple{thunkTy, dfuncT, Val{any_jltypes(EnzymeRules.tape_type(thunkTy))}, Val{byRef}}
-else
-    tt = Tuple{thunkTy, dfuncT, Val{any_jltypes(EnzymeRules.tape_type(thunkTy))}, Val{byRef}, Bool}
-end
+    tt = Tuple{
+        thunkTy,
+        dfuncT,
+        Val{any_jltypes(EnzymeRules.tape_type(thunkTy))},
+        Val{byRef},
+        Bool,
+    }
     mode = get_mode(gutils)
     world = enzyme_extract_world(LLVM.parent(position(B)))
     entry = nested_codegen!(mode, mod, runtime_pfor_augfwd, tt, world)
@@ -472,14 +616,15 @@ end
     return false
 end
 
-function threadsfor_rev(B, orig, gutils, tape)
+@register_rev function threadsfor_rev(B, orig, gutils, tape)
     mod = LLVM.parent(LLVM.parent(LLVM.parent(orig)))
     world = enzyme_extract_world(LLVM.parent(position(B)))
     if is_constant_value(gutils, orig) && is_constant_inst(gutils, orig)
         return
     end
 
-    byRef, sname, dfuncT, vals, thunkTy, TapeType, copies = threadsfor_common(orig, gutils, B, API.DEM_ReverseModeGradient, tape)
+    byRef, sname, dfuncT, vals, thunkTy, TapeType, copies =
+        threadsfor_common(orig, gutils, B, API.DEM_ReverseModeGradient, tape)
 
     STT = if !any_jltypes(TapeType)
         Ptr{TapeType}
@@ -487,11 +632,14 @@ function threadsfor_rev(B, orig, gutils, tape)
         Vector{TapeType}
     end
 
-@static if VERSION < v"1.8-"
-    tt = Tuple{thunkTy, dfuncT, Val{any_jltypes(EnzymeRules.tape_type(thunkTy))}, Val{byRef}, STT }
-else
-    tt = Tuple{thunkTy, dfuncT, Val{any_jltypes(EnzymeRules.tape_type(thunkTy))}, Val{byRef}, STT, Bool}
-end
+    tt = Tuple{
+        thunkTy,
+        dfuncT,
+        Val{any_jltypes(EnzymeRules.tape_type(thunkTy))},
+        Val{byRef},
+        STT,
+        Bool,
+    }
     mode = get_mode(gutils)
     entry = nested_codegen!(mode, mod, runtime_pfor_rev, tt, world)
     push!(function_attributes(entry), EnumAttribute("alwaysinline"))
@@ -510,11 +658,10 @@ end
     return nothing
 end
 
-function newtask_fwd(B, orig, gutils, normalR, shadowR)
+@register_fwd function newtask_fwd(B, orig, gutils, normalR, shadowR)
     if is_constant_value(gutils, orig) && is_constant_inst(gutils, orig)
         return true
     end
-    mod = LLVM.parent(LLVM.parent(LLVM.parent(orig)))
 
     width = get_width(gutils)
     mode = get_mode(gutils)
@@ -524,14 +671,17 @@ function newtask_fwd(B, orig, gutils, normalR, shadowR)
     ops = collect(operands(orig))
 
     vals = LLVM.Value[
-                       unsafe_to_llvm(runtime_newtask_fwd),
-                       unsafe_to_llvm(Val(world)),
-                       new_from_original(gutils, ops[1]),
-                       invert_pointer(gutils, ops[1], B),
-                       new_from_original(gutils, ops[2]),
-                       (sizeof(Int) == sizeof(Int64) ? emit_box_int64! : emit_box_int32!)(B, new_from_original(gutils, ops[3])),
-                       unsafe_to_llvm(Val(width)),
-                      ]
+        unsafe_to_llvm(B, runtime_newtask_fwd),
+        new_from_original(gutils, ops[1]),
+        invert_pointer(gutils, ops[1], B),
+        new_from_original(gutils, ops[2]),
+        (sizeof(Int) == sizeof(Int64) ? emit_box_int64! : emit_box_int32!)(
+            B,
+            new_from_original(gutils, ops[3]),
+        ),
+        unsafe_to_llvm(B, Val(get_runtime_activity(gutils))),
+        unsafe_to_llvm(B, Val(width)),
+    ]
 
     ntask = emit_apply_generic!(B, vals)
     debug_from_orig!(gutils, ntask, orig)
@@ -548,7 +698,7 @@ function newtask_fwd(B, orig, gutils, normalR, shadowR)
     return false
 end
 
-function newtask_augfwd(B, orig, gutils, normalR, shadowR, tapeR)
+@register_aug function newtask_augfwd(B, orig, gutils, normalR, shadowR, tapeR)
     # fn, dfn = augmentAndGradient(fn)
     # t = jl_new_task(fn)
     # # shadow t
@@ -556,10 +706,11 @@ function newtask_augfwd(B, orig, gutils, normalR, shadowR, tapeR)
     if is_constant_value(gutils, orig) && is_constant_inst(gutils, orig)
         return true
     end
-    normal = (unsafe_load(normalR) != C_NULL) ? LLVM.Instruction(unsafe_load(normalR)) : nothing
-    shadow = (unsafe_load(shadowR) != C_NULL) ? LLVM.Instruction(unsafe_load(shadowR)) : nothing
-    mod = LLVM.parent(LLVM.parent(LLVM.parent(orig)))
-    
+    normal =
+        (unsafe_load(normalR) != C_NULL) ? LLVM.Instruction(unsafe_load(normalR)) : nothing
+    shadow =
+        (unsafe_load(shadowR) != C_NULL) ? LLVM.Instruction(unsafe_load(shadowR)) : nothing
+
     T_jlvalue = LLVM.StructType(LLVMType[])
     T_prjlvalue = LLVM.PointerType(T_jlvalue, Tracked)
 
@@ -575,15 +726,18 @@ function newtask_augfwd(B, orig, gutils, normalR, shadowR, tapeR)
     ops = collect(operands(orig))
 
     vals = LLVM.Value[
-                       unsafe_to_llvm(runtime_newtask_augfwd),
-                       unsafe_to_llvm(Val(world)),
-                       new_from_original(gutils, ops[1]),
-                       invert_pointer(gutils, ops[1], B),
-                       new_from_original(gutils, ops[2]),
-                       (sizeof(Int) == sizeof(Int64) ? emit_box_int64! : emit_box_int32!)(B, new_from_original(gutils, ops[3])),
-                       unsafe_to_llvm(Val(width)),
-                       unsafe_to_llvm(Val(ModifiedBetween)),
-                      ]
+        unsafe_to_llvm(B, runtime_newtask_augfwd),
+        new_from_original(gutils, ops[1]),
+        invert_pointer(gutils, ops[1], B),
+        new_from_original(gutils, ops[2]),
+        (sizeof(Int) == sizeof(Int64) ? emit_box_int64! : emit_box_int32!)(
+            B,
+            new_from_original(gutils, ops[3]),
+        ),
+        unsafe_to_llvm(B, Val(get_runtime_activity(gutils))),
+        unsafe_to_llvm(B, Val(width)),
+        unsafe_to_llvm(B, Val(ModifiedBetween)),
+    ]
 
     ntask = emit_apply_generic!(B, vals)
     debug_from_orig!(gutils, ntask, orig)
@@ -594,23 +748,31 @@ function newtask_augfwd(B, orig, gutils, normalR, shadowR, tapeR)
     sret = LLVM.pointercast!(B, sret, LLVM.PointerType(AT, Derived))
 
     if shadowR != C_NULL
-        shadow = LLVM.load!(B, T_prjlvalue, LLVM.inbounds_gep!(B, AT, sret, [LLVM.ConstantInt(0), LLVM.ConstantInt(1)]))
+        shadow = LLVM.load!(
+            B,
+            T_prjlvalue,
+            LLVM.inbounds_gep!(B, AT, sret, [LLVM.ConstantInt(0), LLVM.ConstantInt(1)]),
+        )
         unsafe_store!(shadowR, shadow.ref)
     end
 
     if normalR != C_NULL
-        normal = LLVM.load!(B, T_prjlvalue, LLVM.inbounds_gep!(B, AT, sret, [LLVM.ConstantInt(0), LLVM.ConstantInt(0)]))
+        normal = LLVM.load!(
+            B,
+            T_prjlvalue,
+            LLVM.inbounds_gep!(B, AT, sret, [LLVM.ConstantInt(0), LLVM.ConstantInt(0)]),
+        )
         unsafe_store!(normalR, normal.ref)
     end
 
     return false
 end
 
-function newtask_rev(B, orig, gutils, tape)
+@register_rev function newtask_rev(B, orig, gutils, tape)
     return nothing
 end
 
-function set_task_tid_fwd(B, orig, gutils, normalR, shadowR)
+@register_fwd function set_task_tid_fwd(B, orig, gutils, normalR, shadowR)
     ops = collect(operands(orig))[1:end-1]
     if is_constant_value(gutils, ops[1])
         return true
@@ -621,16 +783,18 @@ function set_task_tid_fwd(B, orig, gutils, normalR, shadowR)
     if width == 1
         nops = LLVM.Value[inv, new_from_original(gutils, ops[2])]
         valTys = API.CValueType[API.VT_Shadow, API.VT_Primal]
-        cal = call_samefunc_with_inverted_bundles!(B, gutils, orig, nops, valTys, #=lookup=#false)
+        cal = call_samefunc_with_inverted_bundles!(B, gutils, orig, nops, valTys, false) #=lookup=#
         debug_from_orig!(gutils, cal, orig)
         callconv!(cal, callconv(orig))
     else
-        for idx in 1:width
-            nops = LLVM.Value[extract_value(B, inv, idx-1),
-                              new_from_original(gutils, ops[2])]
+        for idx = 1:width
+            nops = LLVM.Value[
+                extract_value(B, inv, idx - 1),
+                new_from_original(gutils, ops[2]),
+            ]
             valTys = API.CValueType[API.VT_Shadow, API.VT_Primal]
-            cal = call_samefunc_with_inverted_bundles!(B, gutils, orig, nops, valTys, #=lookup=#false)
-    
+            cal = call_samefunc_with_inverted_bundles!(B, gutils, orig, nops, valTys, false) #=lookup=#
+
             debug_from_orig!(gutils, cal, orig)
             callconv!(cal, callconv(orig))
         end
@@ -639,19 +803,20 @@ function set_task_tid_fwd(B, orig, gutils, normalR, shadowR)
     return false
 end
 
-function set_task_tid_augfwd(B, orig, gutils, normalR, shadowR, tapeR)
+@register_aug function set_task_tid_augfwd(B, orig, gutils, normalR, shadowR, tapeR)
     set_task_tid_fwd(B, orig, gutils, normalR, shadowR)
 end
 
-function set_task_tid_rev(B, orig, gutils, tape)
+@register_rev function set_task_tid_rev(B, orig, gutils, tape)
     return nothing
 end
 
-function enq_work_fwd(B, orig, gutils, normalR, shadowR)
+@register_fwd function enq_work_fwd(B, orig, gutils, normalR, shadowR)
     if is_constant_value(gutils, orig) && is_constant_inst(gutils, orig)
         return true
     end
-    normal = (unsafe_load(normalR) != C_NULL) ? LLVM.Instruction(unsafe_load(normalR)) : nothing
+    normal =
+        (unsafe_load(normalR) != C_NULL) ? LLVM.Instruction(unsafe_load(normalR)) : nothing
     if shadowR != C_NULL && normal !== nothing
         unsafe_store!(shadowR, normal.ref)
     end
@@ -659,7 +824,7 @@ function enq_work_fwd(B, orig, gutils, normalR, shadowR)
     return false
 end
 
-function enq_work_augfwd(B, orig, gutils, normalR, shadowR, tapeR)
+@register_aug function enq_work_augfwd(B, orig, gutils, normalR, shadowR, tapeR)
     enq_work_fwd(B, orig, gutils, normalR, shadowR)
 end
 
@@ -682,13 +847,17 @@ function find_match(mod, name)
     return nothing
 end
 
-function enq_work_rev(B, orig, gutils, tape)
+@register_rev function enq_work_rev(B, orig, gutils, tape)
     # jl_wait(shadow(t))
     origops = LLVM.operands(orig)
     mod = LLVM.parent(LLVM.parent(LLVM.parent(orig)))
     waitfn = find_match(mod, "jl_wait")
     if waitfn === nothing
-        emit_error(B, orig, "Enzyme: could not find jl_wait fn to create shadow of jl_enq_work")
+        emit_error(
+            B,
+            orig,
+            "Enzyme: could not find jl_wait fn to create shadow of jl_enq_work",
+        )
         return nothing
     end
     @assert waitfn !== nothing
@@ -699,35 +868,41 @@ function enq_work_rev(B, orig, gutils, tape)
     return nothing
 end
 
-function wait_fwd(B, orig, gutils, normalR, shadowR)
+@register_fwd function wait_fwd(B, orig, gutils, normalR, shadowR)
     if is_constant_value(gutils, orig) && is_constant_inst(gutils, orig)
         return true
     end
-    normal = (unsafe_load(normalR) != C_NULL) ? LLVM.Instruction(unsafe_load(normalR)) : nothing
+    normal =
+        (unsafe_load(normalR) != C_NULL) ? LLVM.Instruction(unsafe_load(normalR)) : nothing
     if shadowR != C_NULL && normal !== nothing
         unsafe_store!(shadowR, normal.ref)
     end
     return false
 end
 
-function wait_augfwd(B, orig, gutils, normalR, shadowR, tapeR)
+@register_aug function wait_augfwd(B, orig, gutils, normalR, shadowR, tapeR)
     if is_constant_value(gutils, orig) && is_constant_inst(gutils, orig)
         return true
     end
-    normal = (unsafe_load(normalR) != C_NULL) ? LLVM.Instruction(unsafe_load(normalR)) : nothing
+    normal =
+        (unsafe_load(normalR) != C_NULL) ? LLVM.Instruction(unsafe_load(normalR)) : nothing
     if shadowR != C_NULL && normal !== nothing
         unsafe_store!(shadowR, normal.ref)
     end
     return false
 end
 
-function wait_rev(B, orig, gutils, tape)
+@register_rev function wait_rev(B, orig, gutils, tape)
     # jl_enq_work(shadow(t))
     origops = LLVM.operands(orig)
     mod = LLVM.parent(LLVM.parent(LLVM.parent(orig)))
     enq_work_fn = find_match(mod, "jl_enq_work")
     if enq_work_fn === nothing
-        emit_error(B, orig, "Enzyme: could not find jl_enq_work fn to create shadow of wait")
+        emit_error(
+            B,
+            orig,
+            "Enzyme: could not find jl_enq_work fn to create shadow of wait",
+        )
         return nothing
     end
     @assert enq_work_fn !== nothing

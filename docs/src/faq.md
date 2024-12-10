@@ -193,7 +193,7 @@ That is why Enzyme provides a helper function `Enzyme.make_zero` that does this 
 
 ```jldoctest sparse
 Enzyme.make_zero(a)
-Enzyme.gradient(Reverse, sum, a) # This calls make_zero(a)
+Enzyme.gradient(Reverse, sum, a)[1] # This calls make_zero(a)
 
 # output
 
@@ -268,19 +268,21 @@ Enzyme.autodiff(Reverse, f, Active(1.2), Const(Vector{Float64}(undef, 1)), Const
 ((0.0, nothing, nothing, nothing),)
 ```
 
-Passing in a dupliacted (e.g. differentiable) variable for `tmp` now leads to the correct answer.
+Passing in a duplicated (e.g. differentiable) variable for `tmp` now leads to the correct answer.
 
 ```jldoctest storage
-Enzyme.autodiff(Reverse, f, Active(1.2), Duplicated(Vector{Float64}(undef, 1), Vector{Float64}(undef, 1)), Const(1), Const(5))  # Correct (returns 10.367999999999999 == 1.2^4 * 5)
+Enzyme.autodiff(Reverse, f, Active(1.2), Duplicated(Vector{Float64}(undef, 1), zeros(1)), Const(1), Const(5))  # Correct (returns 10.367999999999999 == 1.2^4 * 5)
 
 # output
 
 ((10.367999999999999, nothing, nothing, nothing),)
 ```
 
-However, even if we ignore the semantic guarantee provided by marking `tmp` as constant, another issue arises. When computing the original function, intermediate computations (like in `f` above) can use `tmp` for temporary storage. When computing the derivative, Enzyme also needs additional temporary storage space for the corresponding derivative variables as well. If `tmp` is marked as Const, Enzyme does not have any temporary storage space for the derivatives!
+## Runtime Activity
 
-Recent versions of Enzyme will attempt to error when they detect these latter types of situations, which we will refer to as `activity unstable`. This term is chosen to mirror the Julia notion of type-unstable code (e.g. where a type is not known at compile time). If an expression is activity unstable, it could either be constant, or active, depending on data not known at compile time. For example, consider the following:
+When computing the derivative of mutable variables, Enzyme also needs additional temporary storage space for the corresponding derivative variables. If an argument `tmp` is marked as Const, Enzyme does not have any temporary storage space for the derivatives!
+
+Enzyme will error when they detect these latter types of situations, which we will refer to as `activity unstable`. This term is chosen to mirror the Julia notion of type-unstable code (e.g. where a type is not known at compile time). If an expression is activity unstable, it could either be constant, or active, depending on data not known at compile time. For example, consider the following:
 
 ```julia
 function g(cond, active_var, constant_var)
@@ -293,7 +295,7 @@ end
 Enzyme.autodiff(Forward, g, Const(condition), Duplicated(x, dx), Const(y))
 ```
 
-The returned value here could either by constant or duplicated, depending on the runtime-defined value of `cond`. If `cond` is true, Enzyme simply returns the shadow of `active_var` as the derivative. However, if `cond` is false, there is no derivative shadow for `constant_var` and Enzyme will throw a "Mismatched activity" error. For some simple types, e.g. a float Enzyme can circumvent this issue, for example by returning the float 0. Similarly, for some types like the Symbol type, which are never differentiable, such a shadow value will never be used, and Enzyme can return the original "primal" value as its derivative.  However, for arbitrary data structures, Enzyme presently has no generic mechanism to resolve this.
+The returned value here could either by constant or duplicated, depending on the runtime-defined value of `cond`. If `cond` is true, Enzyme simply returns the shadow of `active_var` as the derivative. However, if `cond` is false, there is no derivative shadow for `constant_var` and Enzyme will throw a `EnzymeRuntimeActivityError` error. For some simple types, e.g. a float Enzyme can circumvent this issue, for example by returning the float 0. Similarly, for some types like the Symbol type, which are never differentiable, such a shadow value will never be used, and Enzyme can return the original "primal" value as its derivative.  However, for arbitrary data structures, Enzyme presently has no generic mechanism to resolve this.
 
 For example consider a third function:
 ```julia
@@ -308,13 +310,17 @@ Enzyme provides a nice utility `Enzyme.make_zero` which takes a data structure a
 
 If one created a new zero'd copy of each return from `g`, this would mean that the derivative `dresult` would have one copy made for the first element, and a second copy made for the second element. This could lead to incorrect results, and is unfortunately not a general resolution. However, for non-mutable variables (e.g. like floats) or non-differrentiable types (e.g. like Symbols) this problem can never arise.
 
-Instead, Enzyme has a special mode known as "Runtime Activity" which can handle these types of situations. It can come with a minor performance reduction, and is therefore off by default. It can be enabled with `Enzyme.API.runtimeActivity!(true)` right after importing Enzyme for the first time. 
+Instead, Enzyme has a special mode known as "Runtime Activity" which can handle these types of situations. It can come with a minor performance reduction, and is therefore off by default. It can be enabled with by setting runtime activity to true in a desired differentiation mode.
 
 The way Enzyme's runtime activity resolves this issue is to return the original primal variable as the derivative whenever it needs to denote the fact that a variable is a constant. As this issue can only arise with mutable variables, they must be represented in memory via a pointer. All addtional loads and stores will now be modified to first check if the primal pointer is the same as the shadow pointer, and if so, treat it as a constant. Note that this check is not saying that the same arrays contain the same values, but rather the same backing memory represents both the primal and the shadow (e.g. `a === b` or equivalently `pointer(a) == pointer(b)`). 
 
 Enabling runtime activity does therefore, come with a sharp edge, which is that if the computed derivative of a function is mutable, one must also check to see if the primal and shadow represent the same pointer, and if so the true derivative of the function is actually zero.
 
-Generally, the preferred solution to these type of activity unstable codes should be to make your variables all activity-stable (e.g. always containing differentiable memory or always containing non-differentiable memory). However, with care, Enzyme does support "Runtime Activity" as a way to differentiate these programs without having to modify your code.
+Generally, the preferred solution to these type of activity unstable codes should be to make your variables all activity-stable (e.g. always containing differentiable memory or always containing non-differentiable memory). However, with care, Enzyme does support "Runtime Activity" as a way to differentiate these programs without having to modify your code. One can enable runtime activity for your code by changing the mode, such as
+
+```julia
+Enzyme.autodiff(set_runtime_activity(Forward), h, Const(condition), Duplicated(x, dx), Const(y))
+```
 
 ## Mixed activity
 
@@ -540,3 +546,112 @@ For `d/d conj(z)`, $\frac12 \left( [u_x + i v_x] + i [u_y + i v_y] \right) = \fr
 ```
 
 Note: when writing rules for complex scalar functions, in reverse mode one needs to conjugate the differential return, and similarly the true result will be the conjugate of that value (in essence you can think of reverse-mode AD as working in the conjugate space).
+
+## What types are differentiable?
+
+Enzyme tracks differentiable dataflow through values. Specifically Enzyme tracks differentiable data in base types like Float32, Float64, Float16, BFloat16, etc.
+
+As a simple example:
+
+```jldoctest types
+f(x) = x * x
+Enzyme.autodiff(Forward, f, Duplicated(3.0, 1.0))
+
+# output
+
+(6.0,)
+```
+
+Enzyme also tracks differentiable data in any types containing these base types (e.g. floats). For example, consider a struct or array containing floats.
+
+```jldoctest types
+struct Pair
+    lhs::Float64
+    rhs::Float64
+end
+f_pair(x) = x.lhs * x.rhs
+Enzyme.autodiff(Forward, f_pair, Duplicated(Pair(3.0, 2.0), Pair(1.0, 0.0)))
+
+# output
+
+(2.0,)
+```
+
+```jldoctest types
+Enzyme.autodiff(Forward, sum, Duplicated([1.0, 2.0, 3.0], [5.0, 0.0, 100.0]))
+
+
+# output
+
+(105.0,)
+```
+
+A differentiable data structure can be arbitrarily complex, such as a linked list.
+
+
+```jldoctest types
+
+struct LList
+    prev::Union{Nothing, LList}
+    value::Float64
+end
+
+function make_list(x::Vector)
+   result = nothing
+   for value in reverse(x)
+      result = LList(result, value)
+   end
+   return result
+end
+
+function list_sum(list::Union{Nothing, LList})
+   result = 0.0
+   while list != nothing
+     result += list.value
+     list = list.prev
+   end
+   return result
+end
+
+list = make_list([1.0, 2.0, 3.0])
+dlist = make_list([5.0, 0.0, 100.0])
+
+Enzyme.autodiff(Forward, list_sum, Duplicated(list, dlist))
+
+# output
+
+(105.0,)
+```
+
+Presently Enzyme only considers floats as base types. As a result, Enzyme does not support differentiating data contained in Ints, Strings, or Vals. If it is desirable for Enzyme to add a base type, please open an issue.
+
+```jldoctest types
+f_int(x) = x * x
+Enzyme.autodiff(Forward, f_int, Duplicated, Duplicated(3, 1))
+
+# output
+
+ERROR: Return type `Int64` not marked Const, but type is guaranteed to be constant
+```
+
+```jldoctest types
+f_str(x) = parse(Float64, x) * parse(Float64, x)
+
+autodiff(Forward, f_str, Duplicated("1.0", "1.0"))
+
+# output
+
+(0.0,)
+```
+
+```jldoctest types
+f_val(::Val{x}) where x = x * x
+
+autodiff(Forward, f_val, Duplicated(Val(1.0), Val(1.0)))
+
+# output
+
+ERROR: Type of ghost or constant type Duplicated{Val{1.0}} is marked as differentiable.
+```
+
+

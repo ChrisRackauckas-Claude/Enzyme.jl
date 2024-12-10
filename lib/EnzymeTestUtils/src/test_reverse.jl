@@ -7,12 +7,7 @@ for N in 1:30
     eval(quote
         function call_with_kwargs(fkwargs::NT, f::FT, $(argexprs...)) where {NT, FT}
             Base.@_inline_meta
-            @static if VERSION ≤ v"1.8"
-                # callsite inline syntax unsupported in <= 1.8 
-                f($(argexprs...); fkwargs...)
-            else
-                @inline f($(argexprs...); fkwargs...)
-            end
+	    @inline f($(argexprs...); fkwargs...)
         end
     end)
 end
@@ -23,11 +18,10 @@ end
 Test `Enzyme.autodiff_thunk` of `f` in `ReverseSplitWithPrimal`-mode against finite
 differences.
 
-`f` has all constraints of the same argument passed to `Enzyme.autodiff_thunk`, with several
+`f` has all constraints of the same argument passed to `Enzyme.autodiff_thunk`, with
 additional constraints:
-- If it mutates one of its arguments, it must not also return that argument.
-- If the return value is a struct, then all floating point numbers contained in the struct
-    or its fields must be in arrays.
+- If an `Array{<:AbstractFloat}` appears in the input/output, then a reshaped version of it
+    may not also appear in the input/output.
 
 # Arguments
 
@@ -39,6 +33,7 @@ additional constraints:
 
 # Keywords
 
+- `rng::AbstractRNG`: The random number generator to use for generating random tangents.
 - `fdm=FiniteDifferences.central_fdm(5, 1)`: The finite differences method to use.
 - `fkwargs`: Keyword arguments to pass to `f`.
 - `rtol`: Relative tolerance for `isapprox`.
@@ -75,11 +70,13 @@ function test_reverse(
     f,
     ret_activity,
     args...;
+    rng::Random.AbstractRNG=Random.default_rng(),
     fdm=FiniteDifferences.central_fdm(5, 1),
     fkwargs::NamedTuple=NamedTuple(),
     rtol::Real=1e-9,
     atol::Real=1e-9,
     testset_name=nothing,
+    runtime_activity::Bool=false
 )
     call_with_captured_kwargs(f, xs...) = f(xs...; fkwargs...)
     if testset_name === nothing
@@ -87,28 +84,29 @@ function test_reverse(
     end
     @testset "$testset_name" begin
         # format arguments for autodiff and FiniteDifferences
-        activities = map(auto_activity, (f, args...))
+        activities = map(Base.Fix1(auto_activity, rng), (f, args...))
         primals = map(x -> x.val, activities)
         # call primal, avoid mutating original arguments
         fcopy = deepcopy(first(primals))
         args_copy = deepcopy(Base.tail(primals))
         y = fcopy(args_copy...; deepcopy(fkwargs)...)
         # generate tangent for output
-        if !_any_batch_duplicated(map(typeof, activities)...)
-            ȳ = ret_activity <: Const ? zero_tangent(y) : rand_tangent(y)
+        if !_any_batch_duplicated(ret_activity, map(typeof, activities)...)
+            ȳ = ret_activity <: Const ? zero_tangent(y) : rand_tangent(rng, y)
         else
-            batch_size = _batch_size(map(typeof, activities)...)
+            batch_size = _batch_size(ret_activity, map(typeof, activities)...)
             ks = ntuple(Symbol ∘ string, batch_size)
             ȳ = ntuple(batch_size) do _
-                ret_activity <: Const ? zero_tangent(y) : rand_tangent(y)
+                return ret_activity <: Const ? zero_tangent(y) : rand_tangent(y)
             end
         end
         # call finitedifferences, avoid mutating original arguments
         dx_fdm = _fd_reverse(fdm, call_with_captured_kwargs, ȳ, activities, !(ret_activity <: Const))
         # call autodiff, allow mutating original arguments
         c_act = Const(call_with_kwargs)
+        mode = set_runtime_activity(ReverseSplitWithPrimal, runtime_activity)
         forward, reverse = autodiff_thunk(
-            ReverseSplitWithPrimal, typeof(c_act), ret_activity, typeof(Const(fkwargs)), map(typeof, activities)...
+            mode, typeof(c_act), ret_activity, typeof(Const(fkwargs)), map(typeof, activities)...
         )
         tape, y_ad, shadow_result = forward(c_act, Const(fkwargs), activities...)
         test_approx(
@@ -135,7 +133,7 @@ function test_reverse(
         else
             # if there's a shadow result, then we need to set it to our random adjoint
             if !(shadow_result === nothing)
-                if !_any_batch_duplicated(map(typeof, activities)...)
+                if !_any_batch_duplicated(ret_activity, map(typeof, activities)...)
                     map_fields_recursive(copyto!, shadow_result, ȳ)
                 else
                     for (sr, dy) in zip(shadow_result, ȳ)

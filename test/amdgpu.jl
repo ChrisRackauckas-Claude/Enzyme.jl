@@ -11,7 +11,7 @@ function mul_kernel(A)
 end
 
 function grad_mul_kernel(A, dA)
-    autodiff_deferred(Reverse, mul_kernel, Const, Duplicated(A, dA))
+    autodiff_deferred(Reverse, Const(mul_kernel), Const, Duplicated(A, dA))
     return nothing
 end
 
@@ -34,19 +34,19 @@ function exp_kernel(A)
 end
 
 function grad_exp_kernel(A, dA)
-    autodiff_deferred(Reverse, exp_kernel, Const, Duplicated(A, dA))
+    autodiff_deferred(Reverse, Const(exp_kernel), Const, Duplicated(A, dA))
     return nothing
 end
 
-# @testset "exp_kernel" begin
-#     A = AMDGPU.ones(64,)
-#     @roc groupsize=length(A)  exp_kernel(A)
-#     A = AMDGPU.ones(64,)
-#     dA = similar(A)
-#     dA .= 1
-#     @roc groupsize=length(A)  grad_exp_kernel(A, dA)
-#     @test all(dA .== exp(1.f0))
-# end
+@testset "exp_kernel" begin
+    A = AMDGPU.ones(64,)
+    @roc groupsize=length(A)  exp_kernel(A)
+    A = AMDGPU.ones(64,)
+    dA = similar(A)
+    dA .= 1
+    @roc groupsize=length(A)  grad_exp_kernel(A, dA)
+    @test all(dA .== exp(1.f0))
+end
 
 function cos_kernel(A)
     i = workitemIdx().x
@@ -57,16 +57,16 @@ function cos_kernel(A)
 end
 
 function grad_cos_kernel(A, dA)
-    autodiff_deferred(Reverse, cos_kernel, Const, Duplicated(A, dA))
+    autodiff_deferred(Reverse, Const(cos_kernel), Const, Duplicated(A, dA))
     return nothing
 end
 
-# @testset "cos_kernel" begin
-#     A = AMDGPU.ones(64,)
-#     @roc groupsize=length(A) cos_kernel(A)
-#     A = AMDGPU.ones(64,)
-#     dA = similar(A)
-#     dA .= 1
-#     @roc groupsize=length(A) grad_cos_kernel(A, dA)
-#     @test all(dA .≈ -sin(1.f0))
-# end
+@testset "cos_kernel" begin
+    A = AMDGPU.ones(64,)
+    @roc groupsize=length(A) cos_kernel(A)
+    A = AMDGPU.ones(64,)
+    dA = similar(A)
+    dA .= 1
+    @roc groupsize=length(A) grad_cos_kernel(A, dA)
+    @test all(dA .≈ -sin(1.f0))
+end

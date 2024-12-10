@@ -22,17 +22,25 @@ function _fd_forward(fdm, f, rettype, y, activities)
     xs = map(x -> x.val, activities)
     ẋs = map(a -> a isa Const ? nothing : a.dval, activities)
     ignores = map(a -> a isa Const, activities)
-    f2 = _wrap_forward_function(f, xs, ignores)
+    f_sig_args = _wrap_forward_function(f, xs, ignores)
     ignores = collect(ignores)
+    _, from_vec_out = to_vec(y)
+    sig_arg_val_vec, from_vec_in = to_vec(xs[.!ignores])
+    # vectorize inputs and outputs of function
+    f_vec = first ∘ to_vec ∘ Base.splat(f_sig_args) ∘ from_vec_in
     if rettype <: Union{Duplicated,DuplicatedNoNeed}
         all(ignores) && return zero_tangent(y)
-        sigargs = zip(xs[.!ignores], ẋs[.!ignores])
-        return FiniteDifferences.jvp(fdm, f2, sigargs...)
+        sig_arg_dval_vec, _ = to_vec(ẋs[.!ignores])
+        ret_deval_vec = FiniteDifferences.jvp(fdm, f_vec,
+                                              (sig_arg_val_vec, sig_arg_dval_vec))
+        return from_vec_out(ret_deval_vec)
     elseif rettype <: Union{BatchDuplicated,BatchDuplicatedNoNeed}
         all(ignores) && return (var"1"=zero_tangent(y),)
-        sig_arg_vals = xs[.!ignores]
         ret_dvals = map(ẋs[.!ignores]...) do sig_args_dvals...
-            FiniteDifferences.jvp(fdm, f2, zip(sig_arg_vals, sig_args_dvals)...)
+            sig_args_dvals_vec, _ = to_vec(sig_args_dvals)
+            ret_dval_vec = FiniteDifferences.jvp(fdm, f_vec,
+                                                 (sig_arg_val_vec, sig_args_dvals_vec))
+            return from_vec_out(ret_dval_vec)
         end
         return NamedTuple{ntuple(Symbol, length(ret_dvals))}(ret_dvals)
     else
@@ -40,6 +48,16 @@ function _fd_forward(fdm, f, rettype, y, activities)
     end
 end
 _fd_forward(fdm, f, ::Type{<:Const}, y, activities) = ()
+
+function multi_tovec(active_return, vals)
+    if active_return
+        v0, v1 = vals[1], Base.tail(vals)
+        res = vcat(to_vec(v0)[1], to_vec(v1)[1])
+        return res
+    else
+        to_vec(vals)[1]
+    end
+end
 
 #=
     _fd_reverse(fdm, f, ȳ, activities, active_return)
@@ -58,7 +76,7 @@ Call `FiniteDifferences.j′vp` on `f` with the arguments `xs` determined by `ac
 function _fd_reverse(fdm, f, ȳ, activities, active_return)
     xs = map(x -> x.val, activities)
     ignores = map(a -> a isa Const, activities)
-    f2 = _wrap_reverse_function(active_return, f, xs, ignores)
+    f_sig_args = _wrap_reverse_function(active_return, f, xs, ignores)
     all(ignores) && return map(zero_tangent, xs)
     ignores = collect(ignores)
     is_batch = _any_batch_duplicated(map(typeof, activities)...)
@@ -74,18 +92,21 @@ function _fd_reverse(fdm, f, ȳ, activities, active_return)
     sigargs = xs[.!ignores]
     s̄igargs = x̄s[.!ignores]
     sigarginds = eachindex(x̄s)[.!ignores]
+    sigargs_vec, from_vec_in = to_vec(sigargs)
+    # vectorize inputs and outputs of function
+    f_vec = Base.Fix1(multi_tovec, active_return) ∘ Base.splat(f_sig_args) ∘ from_vec_in
     if !is_batch
-        fd = FiniteDifferences.j′vp(fdm, f2, (ȳ, s̄igargs...), sigargs...)
+        ȳ_extended = (ȳ, s̄igargs...)
+        ȳ_extended_vec = multi_tovec(active_return, ȳ_extended)
+        fd_vec = only(FiniteDifferences.j′vp(fdm, f_vec, ȳ_extended_vec, sigargs_vec))
+        fd = from_vec_in(fd_vec)
     else
-        fd = Tuple(
-            zip(
-                map(ȳ, s̄igargs...) do y_dval, sigargs_dvals...
-                    FiniteDifferences.j′vp(
-                        fdm, f2, (y_dval, sigargs_dvals...), sigargs...
-                    )
-                end...,
-            ),
-        )
+        fd = Tuple(zip(map(ȳ, s̄igargs...) do ȳ_extended...
+                           ȳ_extended_vec = multi_tovec(active_return, ȳ_extended)
+                           fd_vec = only(FiniteDifferences.j′vp(fdm, f_vec, ȳ_extended_vec,
+                                                                sigargs_vec))
+                           return from_vec_in(fd_vec)
+                       end...))
     end
     @assert length(fd) == length(sigarginds)
     x̄s[sigarginds] = collect(fd)
@@ -143,11 +164,13 @@ function _wrap_reverse_function(active_return, f, xs, ignores)
         retargs = Any[]
         j = 1
 
+        inputs = IdDict()
+
         for (i, (x, ignore)) in enumerate(zip(xs, ignores))
             if ignore
-                push!(callargs, deepcopy(x))
+                push!(callargs, Base.deepcopy_internal(x, inputs))
             else
-                arg = deepcopy(sigargs[j])
+                arg = Base.deepcopy_internal(sigargs[j], inputs)
                 push!(callargs, arg)
                 push!(retargs, arg)
                 j += 1
@@ -161,7 +184,8 @@ function _wrap_reverse_function(active_return, f, xs, ignores)
         # it will already be taken into account. This is implemented using the deepcopy_internal, which
         # will add all objects inside the return into the dict `zeros`.
         zeros = IdDict()
-        origRet = Base.deepcopy_internal(deepcopy(f)(callargs...), zeros)
+        origRet = Base.deepcopy_internal(f, inputs)(callargs...)
+        Base.deepcopy_internal(origRet, zeros)
 
         # we will now explicitly zero all objects returned, and replace any of the args with this
         # zero, if the input and output alias.
@@ -169,9 +193,11 @@ function _wrap_reverse_function(active_return, f, xs, ignores)
             for k in keys(zeros)
                 zeros[k] = zero_tangent(k)
             end
+            return (origRet, Base.deepcopy_internal(retargs, zeros)...)
+        else
+            return (origRet, retargs...)
         end
 
-        return (origRet, Base.deepcopy_internal(retargs, zeros)...)
     end
     return fnew
 end
