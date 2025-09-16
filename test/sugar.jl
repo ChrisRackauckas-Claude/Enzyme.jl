@@ -10,6 +10,12 @@ mul_vector(x, y) = [x[1]*y[2], x[2]*y[1]]
     @test res[1] === inp
 end
 
+
+function diffsize(θ0, X)
+    return copy(X)
+end
+
+
 @testset "Forward Multi-Arg Gradient" begin
 	res = gradient(Forward, mul_scalar, [2.0, 3.0], [2.7, 3.1])
 	@test res[1] ≈ [3.1, 2.7]
@@ -38,7 +44,9 @@ end
 	@test res.derivs[1] ≈ [3.1, 2.7]
 	@test res.derivs[2] ≈ [3.0, 2.0]
 
-
+    res = gradient(Forward, diffsize, [2.0, 3.0], [2.7, 3.1, 4.5])
+    @test res[1] ≈ zeros(3, 2)
+    @test res[2] ≈ [1.0 0.0 0.0; 0.0 1.0 0.0; 0.0 0.0 1.0]
 
 	res = gradient(Forward, mul_scalar, Const([2.0, 3.0]), [2.7, 3.1])
 	@test res[1] == nothing
@@ -181,6 +189,14 @@ end
     @test res.derivs[1] ≈ [3.1 0.0; 0.0 2.7]
     @test res.derivs[2] == nothing
 
+end
+
+tupsq(t) = t[1]*t[2]
+
+@testset "Forward differing element tuple of floats" begin
+    res = Enzyme.gradient(Enzyme.Forward, tupsq, (3.0, Float32(2.0)))[1]
+    @test res[1] ≈ 2.0
+    @test res[2] ≈ 3.0
 end
 
 # these are used in gradient and jacobian tests

@@ -1,12 +1,24 @@
 const VERBOSE_ERRORS = Ref(false)
 
-abstract type CompilationException <: Base.Exception end
+"""
+    EnzymeError
 
-struct EnzymeRuntimeException <: Base.Exception
+Common supertype for Enzyme-specific errors.
+
+This type is made public so that downstream packages can add custom [error hints](https://docs.julialang.org/en/v1/base/base/#Base.Experimental.register_error_hint) for the most common exceptions thrown by Enzyme.
+"""
+abstract type EnzymeError <: Base.Exception end
+
+abstract type CompilationException <: EnzymeError end
+
+struct EnzymeRuntimeException <: EnzymeError
     msg::Cstring
 end
 
 function Base.showerror(io::IO, ece::EnzymeRuntimeException)
+    if isdefined(Base.Experimental, :show_error_hints)
+        Base.Experimental.show_error_hints(io, ece)
+    end
     print(io, "Enzyme execution failed.\n")
     msg = Base.unsafe_string(ece.msg)
     print(io, msg, '\n')
@@ -19,6 +31,9 @@ struct NoDerivativeException <: CompilationException
 end
 
 function Base.showerror(io::IO, ece::NoDerivativeException)
+    if isdefined(Base.Experimental, :show_error_hints)
+        Base.Experimental.show_error_hints(io, ece)
+    end
     print(io, "Enzyme compilation failed.\n")
     if ece.ir !== nothing
     	if VERBOSE_ERRORS[]
@@ -45,16 +60,30 @@ end
 
 struct IllegalTypeAnalysisException <: CompilationException
     msg::String
+    mi::Union{Nothing, Core.MethodInstance}
+    world::Union{Nothing, UInt}
     sval::String
     ir::Union{Nothing,String}
     bt::Union{Nothing,Vector{StackTraces.StackFrame}}
 end
 
 function Base.showerror(io::IO, ece::IllegalTypeAnalysisException)
+    if isdefined(Base.Experimental, :show_error_hints)
+        Base.Experimental.show_error_hints(io, ece)
+    end
     print(io, "Enzyme compilation failed due to illegal type analysis.\n")
     print(io, " This usually indicates the use of a Union type, which is not fully supported with Enzyme.API.strictAliasing set to true [the default].\n")
     print(io, " Ideally, remove the union (which will also make your code faster), or try setting Enzyme.API.strictAliasing!(false) before any autodiff call.\n")
     print(io, " To toggle more information for debugging (needed for bug reports), set Enzyme.Compiler.VERBOSE_ERRORS[] = true (default false)\n")
+        if ece.mi !== nothing
+        print(io, " Failure within method: ", ece.mi, "\n")
+        printstyled(io, "Hint"; bold = true, color = :cyan)
+        printstyled(
+            io,
+            ": catch this exception as `err` and call `code_typed(err)` to inspect the errornous code.\nIf you have Cthulu.jl loaded you can also use `code_typed(err; interactive = true)` to interactively introspect the code.";
+            color = :cyan,
+        )
+    end
     if VERBOSE_ERRORS[]
         if ece.ir !== nothing
             print(io, "Current scope: \n")
@@ -71,6 +100,45 @@ function Base.showerror(io::IO, ece::IllegalTypeAnalysisException)
     end
 end
 
+using InteractiveUtils
+
+function InteractiveUtils.code_typed(ece::IllegalTypeAnalysisException; interactive::Bool=false, kwargs...)
+    mi = ece.mi
+    if mi === nothing
+        throw(AssertionError("code_typed(::IllegalTypeAnalysisException; interactive::Bool=false, kwargs...) not supported for error without mi"))
+    end
+    world = ece.world::UInt
+    mode = Enzyme.API.DEM_ReverseModeCombined
+
+    CT = @static if VERSION >= v"1.11.0-DEV.1552"
+        EnzymeCacheToken(
+            typeof(DefaultCompilerTarget()),
+            false,
+            GPUCompiler.GLOBAL_METHOD_TABLE, #=job.config.always_inline=#
+            EnzymeCompilerParams,
+            world,
+            false,
+            true,
+            true
+        )
+    else
+        Enzyme.Compiler.GLOBAL_REV_CACHE
+    end
+
+    interp = Enzyme.Compiler.Interpreter.EnzymeInterpreter(CT, nothing, world, mode, true)
+
+    sig = mi.specTypes  # XXX: can we just use the method instance?
+    if interactive
+        # call Cthulhu without introducing a dependency on Cthulhu
+        mod = get(Base.loaded_modules, Cthulhu, nothing)
+        mod===nothing && error("Interactive code reflection requires Cthulhu; please install and load this package first.")
+        descend_code_typed = getfield(mod, :descend_code_typed)
+        descend_code_typed(sig; interp, kwargs...)
+    else
+        Base.code_typed_by_type(sig; interp, kwargs...)
+    end
+end
+
 struct IllegalFirstPointerException <: CompilationException
     msg::String
     ir::Union{Nothing,String}
@@ -78,8 +146,11 @@ struct IllegalFirstPointerException <: CompilationException
 end
 
 function Base.showerror(io::IO, ece::IllegalFirstPointerException)
+    if isdefined(Base.Experimental, :show_error_hints)
+        Base.Experimental.show_error_hints(io, ece)
+    end
     print(io, "Enzyme compilation failed due to an internal error (first pointer exception).\n")
-    print(io, " Please open an issue with the code to reproduce and full error log on github.com/EnzymeAD/Enzyme.jl")
+    print(io, " Please open an issue with the code to reproduce and full error log on github.com/EnzymeAD/Enzyme.jl\n")
     print(io, " To toggle more information for debugging (needed for bug reports), set Enzyme.Compiler.VERBOSE_ERRORS[] = true (default false)\n")
     if VERBOSE_ERRORS[]
       if ece.ir !== nothing
@@ -101,8 +172,11 @@ struct EnzymeInternalError <: CompilationException
 end
 
 function Base.showerror(io::IO, ece::EnzymeInternalError)
+    if isdefined(Base.Experimental, :show_error_hints)
+        Base.Experimental.show_error_hints(io, ece)
+    end
     print(io, "Enzyme compilation failed due to an internal error.\n")
-    print(io, " Please open an issue with the code to reproduce and full error log on github.com/EnzymeAD/Enzyme.jl")
+    print(io, " Please open an issue with the code to reproduce and full error log on github.com/EnzymeAD/Enzyme.jl\n")
     print(io, " To toggle more information for debugging (needed for bug reports), set Enzyme.Compiler.VERBOSE_ERRORS[] = true (default false)\n")
     if VERBOSE_ERRORS[]
       if ece.ir !== nothing
@@ -123,20 +197,28 @@ function Base.showerror(io::IO, ece::EnzymeInternalError)
     end
 end
 
-struct EnzymeMutabilityException <: Base.Exception
+struct EnzymeMutabilityException <: EnzymeError
     msg::Cstring
 end
 
 function Base.showerror(io::IO, ece::EnzymeMutabilityException)
+    if isdefined(Base.Experimental, :show_error_hints)
+        Base.Experimental.show_error_hints(io, ece)
+    end
     msg = Base.unsafe_string(ece.msg)
     print(io, msg, '\n')
 end
 
-struct EnzymeRuntimeActivityError <: Base.Exception
+struct EnzymeRuntimeActivityError{MT,WT} <: EnzymeError
     msg::Cstring
+    mi::MT
+    world::WT
 end
 
 function Base.showerror(io::IO, ece::EnzymeRuntimeActivityError)
+    if isdefined(Base.Experimental, :show_error_hints)
+        Base.Experimental.show_error_hints(io, ece)
+    end
     println(io, "Constant memory is stored (or returned) to a differentiable variable.")
     println(
         io,
@@ -159,35 +241,91 @@ function Base.showerror(io::IO, ece::EnzymeRuntimeActivityError)
         io,
         " b) set the Enzyme mode to turn on runtime activity (e.g. autodiff(set_runtime_activity(Reverse), ...) ). This will maintain correctness, but may slightly reduce performance.",
     )
+    if ece.mi !== nothing
+        print(io, " Failure within method: ", ece.mi, "\n")
+        printstyled(io, "Hint"; bold = true, color = :cyan)
+        printstyled(
+            io,
+            ": catch this exception as `err` and call `code_typed(err)` to inspect the errornous code.\nIf you have Cthulu.jl loaded you can also use `code_typed(err; interactive = true)` to interactively introspect the code.\n";
+            color = :cyan,
+        )
+    end
     msg = Base.unsafe_string(ece.msg)
     print(io, msg, '\n')
 end
 
-struct EnzymeNoTypeError <: Base.Exception
+function InteractiveUtils.code_typed(ece::EnzymeRuntimeActivityError; interactive::Bool=false, kwargs...)
+    mi = ece.mi
+    if mi === nothing
+        throw(AssertionError("code_typed(::EnzymeRuntimeActivityError; interactive::Bool=false, kwargs...) not supported for error without mi"))
+    end
+    world = ece.world::UInt
+    mode = Enzyme.API.DEM_ReverseModeCombined
+
+    CT = @static if VERSION >= v"1.11.0-DEV.1552"
+        EnzymeCacheToken(
+            typeof(DefaultCompilerTarget()),
+            false,
+            GPUCompiler.GLOBAL_METHOD_TABLE, #=job.config.always_inline=#
+            EnzymeCompilerParams,
+            world,
+            false,
+            true,
+            true
+        )
+    else
+        Enzyme.Compiler.GLOBAL_REV_CACHE
+    end
+
+    interp = Enzyme.Compiler.Interpreter.EnzymeInterpreter(CT, nothing, world, mode, true)
+
+    sig = mi.specTypes  # XXX: can we just use the method instance?
+    if interactive
+        # call Cthulhu without introducing a dependency on Cthulhu
+        mod = get(Base.loaded_modules, Cthulhu, nothing)
+        mod===nothing && error("Interactive code reflection requires Cthulhu; please install and load this package first.")
+        descend_code_typed = getfield(mod, :descend_code_typed)
+        descend_code_typed(sig; interp, kwargs...)
+    else
+        Base.code_typed_by_type(sig; interp, kwargs...)
+    end
+end
+
+
+struct EnzymeNoTypeError <: EnzymeError
     msg::Cstring
 end
 
 function Base.showerror(io::IO, ece::EnzymeNoTypeError)
+    if isdefined(Base.Experimental, :show_error_hints)
+        Base.Experimental.show_error_hints(io, ece)
+    end
     print(io, "Enzyme cannot deduce type\n")
     msg = Base.unsafe_string(ece.msg)
     print(io, msg, '\n')
 end
 
-struct EnzymeNoShadowError <: Base.Exception
+struct EnzymeNoShadowError <: EnzymeError
     msg::Cstring
 end
 
 function Base.showerror(io::IO, ece::EnzymeNoShadowError)
+    if isdefined(Base.Experimental, :show_error_hints)
+        Base.Experimental.show_error_hints(io, ece)
+    end
     print(io, "Enzyme could not find shadow for value\n")
     msg = Base.unsafe_string(ece.msg)
     print(io, msg, '\n')
 end
 
-struct EnzymeNoDerivativeError <: Base.Exception
+struct EnzymeNoDerivativeError <: EnzymeError
     msg::Cstring
 end
 
 function Base.showerror(io::IO, ece::EnzymeNoDerivativeError)
+    if isdefined(Base.Experimental, :show_error_hints)
+        Base.Experimental.show_error_hints(io, ece)
+    end
     msg = Base.unsafe_string(ece.msg)
     print(io, msg, '\n')
 end
@@ -271,7 +409,15 @@ function julia_error(
                     println(io)
                 end
             end
-            emit_error(B, nothing, msg2, EnzymeNoDerivativeError)
+    	    if data2 != C_NULL
+        		data2 = LLVM.Value(data2)
+                if value_type(data2) != LLVM.IntType(1)
+                    data2 = nothing
+                end
+            else
+                data2 = nothing
+            end
+            emit_error(B, nothing, msg2, EnzymeNoDerivativeError, data2)
             return C_NULL
         end
         throw(NoDerivativeException(msg, ir, bt))
@@ -307,16 +453,25 @@ function julia_error(
         sval = Base.unsafe_string(ip)
         API.EnzymeStringFree(ip)
 
+        mi = nothing
+        world = nothing
+
         if isa(val, LLVM.Instruction)
+            f = LLVM.parent(LLVM.parent(val))::LLVM.Function
             mi, rt = enzyme_custom_extract_mi(
-                LLVM.parent(LLVM.parent(val))::LLVM.Function,
+                f,
                 false,
             ) #=error=#
-            if mi !== nothing
-                msg *= "\n" * string(mi) * "\n"
-            end
+            world = enzyme_extract_world(f)
+        elseif isa(val, LLVM.Argument)
+            f = parent_scope(val)::LLVM.Function
+            mi, rt = enzyme_custom_extract_mi(
+                f,
+                false,
+            ) #=error=#
+            world = enzyme_extract_world(f)
         end
-        throw(IllegalTypeAnalysisException(msg, sval, ir, bt))
+        throw(IllegalTypeAnalysisException(msg, mi, world, sval, ir, bt))
     elseif errtype == API.ET_NoType
         @assert B != C_NULL
         B = IRBuilder(B)
@@ -417,6 +572,30 @@ function julia_error(
             if cur in keys(seen)
                 return seen[cur]
             end
+
+@static if VERSION < v"1.11-"
+else   
+	if isa(cur, LLVM.LoadInst) && isa(value_type(cur), LLVM.PointerType) && LLVM.addrspace(value_type(operands(cur)[1])) == Derived
+                    larg, off = get_base_and_offset(operands(cur)[1]; inst=ncur, inttoptr=true)
+		    if isa(larg, LLVM.ConstantInt) && off == sizeof(Int)
+			ptr = reinterpret(Ptr{Cvoid}, convert(UInt, larg))
+			obj = Base.unsafe_pointer_to_objref(ptr)
+                        if obj isa Memory && obj == typeof(obj).instance
+                            return make_batched(ncur, prevbb)
+                        end
+		    end
+                end
+	if isa(cur, LLVM.ConstantExpr) && isa(value_type(cur), LLVM.PointerType) && LLVM.addrspace(value_type(cur)) == Derived
+		larg, off = get_base_and_offset(cur; inst=first(instructions(position(prevbb))), inttoptr=true)
+		if isa(larg, LLVM.ConstantInt) && (off == sizeof(Int) || off == 0)
+			ptr = reinterpret(Ptr{Cvoid}, convert(UInt, larg))
+			obj = Base.unsafe_pointer_to_objref(ptr)
+                        if obj isa Memory && obj == typeof(obj).instance
+                            return make_batched(ncur, prevbb)
+                        end
+		    end
+                end
+end
 
             legal, TT, byref = abs_typeof(cur, true)
 
@@ -605,22 +784,25 @@ end
             end
 
             if isa(cur, LLVM.InsertValueInst)
-                lhs = make_replacement(operands(cur)[1], prevbb)
+                B2 = IRBuilder()
+                position!(B2, LLVM.Instruction(LLVM.API.LLVMGetNextInstruction(ncur)))
+
+                lhs = make_replacement(operands(cur)[1], B2)
                 if illegal
                     return ncur
                 end
-                rhs = make_replacement(operands(cur)[2], prevbb)
+                rhs = make_replacement(operands(cur)[2], B2)
                 if illegal
                     return ncur
                 end
                 if lhs == operands(cur)[1] && rhs == operands(cur)[2]
-                    return make_batched(ncur, prevbb)
+                    return make_batched(ncur, cur)
                 end
                 inds = LLVM.API.LLVMGetIndices(cur.ref)
                 ninds = LLVM.API.LLVMGetNumIndices(cur.ref)
                 jinds = Cuint[unsafe_load(inds, i) for i = 1:ninds]
                 if width == 1
-                    nv = API.EnzymeInsertValue(prevbb, lhs, rhs, jinds)
+                    nv = API.EnzymeInsertValue(B2, lhs, rhs, jinds)
                     push!(created, nv)
                     seen[cur] = nv
                     return nv
@@ -630,9 +812,9 @@ end
                         jindsv = copy(jinds)
                         pushfirst!(jindsv, idx - 1)
                         shadowres = API.EnzymeInsertValue(
-                            prevbb,
+                            B2,
                             shadowres,
-                            extract_value!(prevbb, rhs, idx - 1),
+                            extract_value!(B2, rhs, idx - 1),
                             jindsv,
                         )
                         if isa(shadowres, LLVM.Instruction)
@@ -757,7 +939,32 @@ end
                 Base.show_backtrace(io, bt)
             end
         end
-        emit_error(b, nothing, msg2, EnzymeRuntimeActivityError)
+        
+	mi = nothing
+        world = nothing
+
+        if isa(val, LLVM.Instruction)
+            f = LLVM.parent(LLVM.parent(val))::LLVM.Function
+            mi, rt = enzyme_custom_extract_mi(
+                f,
+                false,
+            ) #=error=#
+            world = enzyme_extract_world(f)
+        elseif isa(val, LLVM.Argument)
+            f = parent_scope(val)::LLVM.Function
+            mi, rt = enzyme_custom_extract_mi(
+                f,
+                false,
+            ) #=error=#
+            world = enzyme_extract_world(f)
+        end
+        mode = Enzyme.API.DEM_ReverseModeCombined
+
+	if mi !== nothing
+	    emit_error(b, nothing, (msg2, mi, world), EnzymeRuntimeActivityError{Core.MethodInstance, UInt})
+	else
+	    emit_error(b, nothing, msg2, EnzymeRuntimeActivityError{Nothing, Nothing})
+	end
         return C_NULL
     elseif errtype == API.ET_GetIndexError
         @assert B != C_NULL
@@ -777,3 +984,19 @@ end
     throw(AssertionError("Unknown errtype"))
 end
 
+struct EnzymeNonScalarReturnException <: EnzymeError
+    object
+    extra::String
+end
+
+function Base.showerror(io::IO, ece::EnzymeNonScalarReturnException)
+    if isdefined(Base.Experimental, :show_error_hints)
+        Base.Experimental.show_error_hints(io, ece)
+    end
+    println(io, "Return type of differentiated function was not a scalar as required, found ", ece.object)
+    println(io, "If calling Enzyme.autodiff(Reverse, f, Active, ...), try Enzyme.autodiff_thunk(Reverse, f, Duplicated, ....)")
+    println(io, "If calling Enzyme.gradient, try Enzyme.jacobian")
+    if length(ece.extra) != 0
+        print(io, ece.extra)
+    end
+end

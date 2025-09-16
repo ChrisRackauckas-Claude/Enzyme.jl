@@ -29,7 +29,7 @@ function rule_backedge_holder_generator(world::UInt, source, self, ft::Type)
     sig = Tuple{typeof(Base.identity), Int}
     min_world = Ref{UInt}(typemin(UInt))
     max_world = Ref{UInt}(typemax(UInt))
-    has_ambig = Ptr{Int32}(C_NULL) 
+    has_ambig = Ptr{Int32}(C_NULL)
     mthds = Base._methods_by_ftype(
         sig,
         nothing,
@@ -68,34 +68,18 @@ function rule_backedge_holder_generator(world::UInt, source, self, ft::Type)
     ### TODO: backedge from inactive, augmented_primal, forward, reverse
     edges = Any[]
 
-    @static if false
     if ft == typeof(EnzymeRules.augmented_primal)
-	# this is illegal
-        # sig = Tuple{typeof(EnzymeRules.augmented_primal), <:RevConfig, <:Annotation, Type{<:Annotation},Vararg{Annotation}}
-        # push!(edges, (ccall(:jl_method_table_for, Any, (Any,), sig), sig))
-	push!(edges, GPUCompiler.generic_methodinstance(typeof(EnzymeRules.augmented_primal), Tuple{<:RevConfig, <:Annotation, Type{<:Annotation},Vararg{Annotation}}, world))
+        sig = Tuple{typeof(EnzymeRules.augmented_primal), <:RevConfig, <:Annotation, Type{<:Annotation},Vararg{Annotation}}
+        push!(edges, ccall(:jl_method_table_for, Any, (Any,), sig))
+        push!(edges, sig)
     elseif ft == typeof(EnzymeRules.forward)
-	# this is illegal
-        # sig = Tuple{typeof(EnzymeRules.forward), <:FwdConfig, <:Annotation, Type{<:Annotation},Vararg{Annotation}}
-        # push!(edges, (ccall(:jl_method_table_for, Any, (Any,), sig), sig))
-	push!(edges, GPUCompiler.generic_methodinstance(typeof(EnzymeRules.forward), Tuple{<:FwdConfig, <:Annotation, Type{<:Annotation},Vararg{Annotation}}, world))
+        sig = Tuple{typeof(EnzymeRules.forward), <:FwdConfig, <:Annotation, Type{<:Annotation},Vararg{Annotation}}
+        push!(edges, ccall(:jl_method_table_for, Any, (Any,), sig))
+        push!(edges, sig)
     else
-        # sig = Tuple{typeof(EnzymeRules.inactive), Vararg{Annotation}}
-        # push!(edges, (ccall(:jl_method_table_for, Any, (Any,), sig), sig))
-	push!(edges, GPUCompiler.generic_methodinstance(typeof(EnzymeRules.inactive), Tuple{Vararg{Annotation}}, world))
-
-        # sig = Tuple{typeof(EnzymeRules.inactive_noinl), Vararg{Annotation}}
-        # push!(edges, (ccall(:jl_method_table_for, Any, (Any,), sig), sig))
-	push!(edges, GPUCompiler.generic_methodinstance(typeof(EnzymeRules.inactive_noinl), Tuple{Vararg{Annotation}}, world))
-
-        # sig = Tuple{typeof(EnzymeRules.noalias), Vararg{Any}}
-        # push!(edges, (ccall(:jl_method_table_for, Any, (Any,), sig), sig))
-	push!(edges, GPUCompiler.generic_methodinstance(typeof(EnzymeRules.noalias), Tuple{Vararg{Any}}, world))
-		
-        # sig = Tuple{typeof(EnzymeRules.inactive_type), Type}
-        # push!(edges, (ccall(:jl_method_table_for, Any, (Any,), sig), sig))
-	push!(edges, GPUCompiler.generic_methodinstance(typeof(EnzymeRules.inactive_type), Tuple{Type}, world))
-    end
+        sig = Tuple{typeof(EnzymeRules.inactive), Vararg{Annotation}}
+        push!(edges, ccall(:jl_method_table_for, Any, (Any,), sig))
+        push!(edges, sig)
     end
 
     new_ci.edges = edges
@@ -110,7 +94,7 @@ function rule_backedge_holder_generator(world::UInt, source, self, ft::Type)
     new_ci.slotflags = UInt8[0x00 for i = 1:2]
 
     # return the codegen world age
-    push!(new_ci.code, Core.Compiler.ReturnNode(0))
+    push!(new_ci.code, Core.Compiler.ReturnNode(world))
     push!(new_ci.ssaflags, 0x00)   # Julia's native compilation pipeline (and its verifier) expects `ssaflags` to be the same length as `code`
     @static if isdefined(Core, :DebugInfo)
     else
@@ -124,39 +108,6 @@ end
 @eval Base.@assume_effects :removable :foldable :nothrow @inline function rule_backedge_holder(ft)
     $(Expr(:meta, :generated_only))
     $(Expr(:meta, :generated, rule_backedge_holder_generator))
-end
-
-begin
-    # Forward-rule catch all
-    fwd_rule_be = GPUCompiler.methodinstance(typeof(rule_backedge_holder), Tuple{typeof(EnzymeRules.forward)})
-    # Reverse-rule catch all
-    rev_rule_be = GPUCompiler.methodinstance(typeof(rule_backedge_holder), Tuple{typeof(EnzymeRules.augmented_primal)})
-    # Inactive-rule catch all
-    ina_rule_be = GPUCompiler.methodinstance(typeof(rule_backedge_holder), Tuple{typeof(EnzymeRules.inactive)})
-    # All other derivative-related catch all (just for autodiff, not inference), including inactive_noinl, noalias, and inactive_type
-    gen_rule_be = GPUCompiler.methodinstance(typeof(rule_backedge_holder), Tuple{Val{0}})
-
-
-    fwd_sig = Tuple{typeof(EnzymeRules.forward), <:EnzymeRules.FwdConfig, <:Enzyme.EnzymeCore.Annotation, Type{<:Enzyme.EnzymeCore.Annotation},Vararg{Enzyme.EnzymeCore.Annotation}}
-    EnzymeRules.add_mt_backedge!(fwd_rule_be, ccall(:jl_method_table_for, Any, (Any,), fwd_sig)::Core.MethodTable, fwd_sig)
-
-    rev_sig = Tuple{typeof(EnzymeRules.augmented_primal), <:EnzymeRules.RevConfig, <:Enzyme.EnzymeCore.Annotation, Type{<:Enzyme.EnzymeCore.Annotation},Vararg{Enzyme.EnzymeCore.Annotation}}
-    EnzymeRules.add_mt_backedge!(rev_rule_be, ccall(:jl_method_table_for, Any, (Any,), rev_sig)::Core.MethodTable, rev_sig)
-
-
-    for ina_sig in (
-        Tuple{typeof(EnzymeRules.inactive), Vararg{Any}},
-    )
-        EnzymeRules.add_mt_backedge!(ina_rule_be, ccall(:jl_method_table_for, Any, (Any,), ina_sig)::Core.MethodTable, ina_sig)
-    end
-
-    for gen_sig in (
-        Tuple{typeof(EnzymeRules.inactive_noinl), Vararg{Any}},
-        Tuple{typeof(EnzymeRules.noalias), Vararg{Any}},
-        Tuple{typeof(EnzymeRules.inactive_type), Type},
-    )
-        EnzymeRules.add_mt_backedge!(gen_rule_be, ccall(:jl_method_table_for, Any, (Any,), gen_sig)::Core.MethodTable, gen_sig)
-    end
 end
 
 struct EnzymeInterpreter{T} <: AbstractInterpreter
@@ -178,9 +129,53 @@ struct EnzymeInterpreter{T} <: AbstractInterpreter
 
     forward_rules::Bool
     reverse_rules::Bool
+    inactive_rules::Bool
     broadcast_rewrite::Bool
+
+    # When false, leave the check for within_autodiff to the handler.
+    within_autodiff_rewrite::Bool
+
     handler::T
 end
+
+const SigCache = Dict{Tuple, Dict{UInt, Base.IdSet{Type}}}()
+function get_rule_signatures(f, TT, world)
+    subdict = if haskey(SigCache, (f, TT))
+       SigCache[(f, TT)]
+    else
+       tmp = Dict{UInt, Base.IdSet{Type}}()
+       SigCache[(f, TT)] = tmp
+       tmp
+    end
+    if haskey(subdict, world)
+       return subdict[world]
+    end
+    fwdrules_meths = Base._methods(f, TT, -1, world)::Vector
+    sigs = Type[]
+    for rule in fwdrules_meths
+        push!(sigs, (rule::Core.MethodMatch).method.sig)
+    end
+    result = Base.IdSet{Type}(sigs)
+    subdict[world] = result
+    return result
+end
+
+function rule_sigs_equal(a, b)
+    if length(a) != length(b)
+        return false
+    end
+    for v in a
+        if v in b
+            continue
+        end
+        return false
+    end
+    return true
+end
+
+const LastFwdWorld = Ref(Base.IdSet{Type}())
+const LastRevWorld = Ref(Base.IdSet{Type}())
+const LastInaWorld = Ref(Base.IdSet{Type}())
 
 function EnzymeInterpreter(
     cache_or_token,
@@ -188,7 +183,9 @@ function EnzymeInterpreter(
     world::UInt,
     forward_rules::Bool,
     reverse_rules::Bool,
+    inactive_rules::Bool,
     broadcast_rewrite::Bool = true,
+    within_autodiff_rewrite::Bool = true,
     handler = nothing
 )
     @assert world <= Base.get_world_counter()
@@ -197,6 +194,39 @@ function EnzymeInterpreter(
         InferenceParams()
     else
         InferenceParams(; unoptimize_throw_blocks=false)
+    end
+    
+    @static if HAS_INTEGRATED_CACHE
+
+    else
+        cache_or_token = cache_or_token::CodeCache
+        invalid = false
+        if forward_rules
+            fwdrules = get_rule_signatures(EnzymeRules.forward, Tuple{<:FwdConfig, <:Annotation, Type{<:Annotation}, Vararg{Annotation}}, world)
+            if !rule_sigs_equal(fwdrules, LastFwdWorld[])
+                LastFwdWorld[] = fwdrules
+                invalid = true
+            end
+        end
+        if reverse_rules
+            revrules = get_rule_signatures(EnzymeRules.augmented_primal, Tuple{<:RevConfig, <:Annotation, Type{<:Annotation}, Vararg{Annotation}}, world)
+            if !rule_sigs_equal(revrules, LastRevWorld[])
+                LastRevWorld[] = revrules
+                invalid = true
+            end
+        end
+
+        if inactive_rules
+            inarules = get_rule_signatures(EnzymeRules.inactive, Tuple{Vararg{Any}}, world)
+            if !rule_sigs_equal(inarules, LastInaWorld[])
+                LastInaWorld[] = inarules
+                invalid = true
+            end
+        end
+        
+        if invalid
+            Base.empty!(cache_or_token)
+        end
     end
 
     return EnzymeInterpreter(
@@ -212,9 +242,11 @@ function EnzymeInterpreter(
         # parameters for inference and optimization
         parms,
         OptimizationParams(),
-        forward_rules,
-        reverse_rules,
-        broadcast_rewrite,
+        forward_rules::Bool,
+        reverse_rules::Bool,
+        inactive_rules::Bool,
+        broadcast_rewrite::Bool,
+        within_autodiff_rewrite::Bool,
         handler
     )
 end
@@ -224,9 +256,44 @@ EnzymeInterpreter(
     mt::Union{Nothing,Core.MethodTable},
     world::UInt,
     mode::API.CDerivativeMode,
+    inactive_rules::Bool,
     broadcast_rewrite::Bool = true,
+    within_autodiff_rewrite::Bool = true,
     handler = nothing
-) = EnzymeInterpreter(cache_or_token, mt, world, mode == API.DEM_ForwardMode, mode == API.DEM_ReverseModeCombined || mode == API.DEM_ReverseModePrimal || mode == API.DEM_ReverseModeGradient, broadcast_rewrite, handler)
+) = EnzymeInterpreter(cache_or_token, mt, world, mode == API.DEM_ForwardMode, mode == API.DEM_ReverseModeCombined || mode == API.DEM_ReverseModePrimal || mode == API.DEM_ReverseModeGradient, inactive_rules, broadcast_rewrite, within_autodiff_rewrite, handler)
+
+function EnzymeInterpreter(interp::EnzymeInterpreter;
+    cache_or_token = (@static if HAS_INTEGRATED_CACHE
+        interp.token
+    else
+        interp.code_cache
+    end),
+    mt = interp.method_table,
+    local_cache = interp.local_cache,
+    world = interp.world,
+    inf_params = interp.inf_params,
+    opt_params = interp.opt_params,
+    forward_rules = interp.forward_rules,
+    reverse_rules = interp.reverse_rules,
+    inactive_rules = interp.inactive_rules,
+    broadcast_rewrite = interp.broadcast_rewrite,
+    within_autodiff_rewrite = interp.within_autodiff_rewrite,
+    handler = interp.handler)
+    return EnzymeInterpreter(
+        cache_or_token,
+        mt,
+        local_cache,
+        world,
+        inf_params,
+        opt_params,
+        forward_rules,
+        reverse_rules,
+        inactive_rules,
+        broadcast_rewrite,
+        within_autodiff_rewrite,
+        handler
+    )
+end
 
 Core.Compiler.InferenceParams(@nospecialize(interp::EnzymeInterpreter)) = interp.inf_params
 Core.Compiler.OptimizationParams(@nospecialize(interp::EnzymeInterpreter)) = interp.opt_params
@@ -251,7 +318,9 @@ Core.Compiler.may_compress(@nospecialize(::EnzymeInterpreter)) = true
 #      but as far as I understand Enzyme wants "always inlining, except special cased functions",
 #      so I guess we really don't want to discard sources?
 Core.Compiler.may_discard_trees(@nospecialize(::EnzymeInterpreter)) = false
-Core.Compiler.verbose_stmt_info(@nospecialize(::EnzymeInterpreter)) = false
+if isdefined(Core.Compiler, :verbose_stmt_inf)
+    Core.Compiler.verbose_stmt_info(@nospecialize(::EnzymeInterpreter)) = false
+end
 
 Core.Compiler.method_table(@nospecialize(interp::EnzymeInterpreter)) = interp.method_table
 
@@ -337,6 +406,7 @@ function Core.Compiler.abstract_call_gf_by_type(
     sv::AbsIntState,
     max_methods::Int,
 )
+    
     ret = @invoke Core.Compiler.abstract_call_gf_by_type(
         interp::AbstractInterpreter,
         f::Any,
@@ -346,6 +416,28 @@ function Core.Compiler.abstract_call_gf_by_type(
         sv::AbsIntState,
         max_methods::Int,
     )
+    if isdefined(Core.Compiler, :Future) # if stackless inference
+        return Core.Compiler.Future{Core.Compiler.CallMeta}(ret, interp, sv) do ret, interp, sv
+            callinfo = ret.info
+            specTypes = simplify_kw(atype)
+
+            if is_primitive_func(specTypes)
+                callinfo = NoInlineCallInfo(callinfo, atype, :primitive)
+            elseif is_alwaysinline_func(specTypes)
+                callinfo = AlwaysInlineCallInfo(callinfo, atype)
+            else
+                method_table = Core.Compiler.method_table(interp)
+                if interp.inactive_rules && EnzymeRules.is_inactive_from_sig(specTypes; world = interp.world, method_table)
+                    callinfo = NoInlineCallInfo(callinfo, atype, :inactive)
+                elseif interp.forward_rules && EnzymeRules.has_frule_from_sig(specTypes; world = interp.world, method_table)
+                    callinfo = NoInlineCallInfo(callinfo, atype, :frule)
+                elseif interp.reverse_rules && EnzymeRules.has_rrule_from_sig(specTypes; world = interp.world, method_table)
+                    callinfo = NoInlineCallInfo(callinfo, atype, :rrule)
+                end
+            end
+            return Core.Compiler.CallMeta(ret.rt, ret.exct, ret.effects, callinfo)
+        end
+    end
     callinfo = ret.info
     specTypes = simplify_kw(atype)
 
@@ -355,34 +447,14 @@ function Core.Compiler.abstract_call_gf_by_type(
         callinfo = AlwaysInlineCallInfo(callinfo, atype)
     else
         method_table = Core.Compiler.method_table(interp)
-        if EnzymeRules.is_inactive_from_sig(specTypes; world = interp.world, method_table)
+        if interp.inactive_rules && EnzymeRules.is_inactive_from_sig(specTypes; world = interp.world, method_table)
             callinfo = NoInlineCallInfo(callinfo, atype, :inactive)
-        else
-            if interp.forward_rules
-              if EnzymeRules.has_frule_from_sig(specTypes; world = interp.world, method_table)
-                callinfo = NoInlineCallInfo(callinfo, atype, :frule)
-              end
-            end
-        
-            if interp.reverse_rules
-                if EnzymeRules.has_rrule_from_sig(specTypes; world = interp.world, method_table)
-                  callinfo = NoInlineCallInfo(callinfo, atype, :rrule)
-                end
-            end
+        elseif interp.forward_rules && EnzymeRules.has_frule_from_sig(specTypes; world = interp.world, method_table)
+            callinfo = NoInlineCallInfo(callinfo, atype, :frule)
+        elseif interp.reverse_rules && EnzymeRules.has_rrule_from_sig(specTypes; world = interp.world, method_table)
+            callinfo = NoInlineCallInfo(callinfo, atype, :rrule)
         end
-
-        if interp.forward_rules
-            Core.Compiler.add_backedge!(sv, GPUCompiler.methodinstance(typeof(Enzyme.Compiler.Interpreter.rule_backedge_holder), Tuple{typeof(EnzymeRules.forward)}, interp.world)::Core.MethodInstance)
-            Enzyme.Compiler.Interpreter.rule_backedge_holder(Base.inferencebarrier(EnzymeRules.forward))
-        end
-        if interp.reverse_rules
-            Core.Compiler.add_backedge!(sv, GPUCompiler.methodinstance(typeof(Enzyme.Compiler.Interpreter.rule_backedge_holder), Tuple{typeof(EnzymeRules.augmented_primal)}, interp.world)::Core.MethodInstance)
-            Enzyme.Compiler.Interpreter.rule_backedge_holder(Base.inferencebarrier(EnzymeRules.augmented_primal))
-        end
-        Core.Compiler.add_backedge!(sv, GPUCompiler.methodinstance(typeof(Enzyme.Compiler.Interpreter.rule_backedge_holder), Tuple{typeof(EnzymeRules.inactive)}, interp.world)::Core.MethodInstance)
-        Enzyme.Compiler.Interpreter.rule_backedge_holder(Base.inferencebarrier(typeof(EnzymeRules.inactive)))
     end
-
     @static if VERSION ≥ v"1.11-"
         return Core.Compiler.CallMeta(ret.rt, ret.exct, ret.effects, callinfo)
     else
@@ -808,25 +880,43 @@ end
 @generated function same_sized(x::Tuple)
     result = :true
     prev = nothing
+    todo = Tuple{Expr, Type}[]
     for i in 1:length(x.parameters)
-        if x.parameters[i] <: Number
+	push!(todo, (:(x[$i]), x.parameters[i]))
+    end
+    while length(todo) != 0
+	expr, ty = pop!(todo)
+        if ty <: Number || ty <: Base.RefValue
             continue
         end
+	if ty <: Base.Broadcast.Broadcasted{<:Base.Broadcast.DefaultArrayStyle, Nothing}
+	    for i in 1:length(ty.parameters[4].parameters)
+	       push!(todo, (:($expr.args[$i]), ty.parameters[4].parameters[i]))
+	    end
+	    continue
+	end
+	@assert ty <: AbstractArray
         if prev == nothing
             prev = quote
-                sz = size(x[$i])
+                sz = size($expr)
             end
             continue
         end
         if result == :true
             result = quote
-                sz == size(x[$i])
+                sz == size($expr)
             end
         else
             result = quote
-                $result && sz == size(x[$i])
+                $result && sz == size($expr)
             end
         end
+    end
+    if result == :true
+	return quote
+	   Base.@_inline_meta
+   	   true
+  	end
     end
     return quote
         Base.@_inline_meta
@@ -835,29 +925,78 @@ end
     end
 end
 
+@generated function first_array(x::Tuple)
+    result = :true
+    prev = nothing
+    todo = Tuple{Expr, Type}[]
+    for i in 1:length(x.parameters)
+	push!(todo, (:(x[$i]), x.parameters[i]))
+    end
+    while length(todo) != 0
+	expr, ty = pop!(todo)
+        if ty <: Number || ty <: Base.RefValue
+            continue
+        end
+	if ty <: Base.Broadcast.Broadcasted{<:Base.Broadcast.DefaultArrayStyle, Nothing}
+	    for i in 1:length(ty.parameters[4].parameters)
+	       push!(todo, (:($expr.args[$i]), ty.parameters[4].parameters[i]))
+	    end
+	    continue
+	end
+	@assert ty <: AbstractArray
+	return quote
+	    Base.@_inline_meta
+	    $expr
+	end
+    end
+    return quote
+        Base.@_inline_meta
+	throw(AssertionError("No array"))
+    end
+end
 
-Base.@propagate_inbounds overload_broadcast_getindex(A::Union{Ref,AbstractArray{<:Any,0},Number}, I) = A[] # Scalar-likes can just ignore all indices
-Base.@propagate_inbounds overload_broadcast_getindex(::Ref{Type{T}}, I) where {T} = T
+
+Base.@propagate_inbounds @inline overload_broadcast_getindex(A::Union{Ref,AbstractArray{<:Any,0},Number}, I) = A[] # Scalar-likes can just ignore all indices
+Base.@propagate_inbounds @inline overload_broadcast_getindex(::Ref{Type{T}}, I) where {T} = T
 # Tuples are statically known to be singleton or vector-like
-Base.@propagate_inbounds overload_broadcast_getindex(A::Tuple{Any}, I) = A[1]
-Base.@propagate_inbounds overload_broadcast_getindex(A::Tuple, I) = error("unhandled") # A[I[1]]
-Base.@propagate_inbounds overload_broadcast_getindex(A, I) = A[I]
+Base.@propagate_inbounds @inline overload_broadcast_getindex(A::Tuple{Any}, I) = A[1]
+Base.@propagate_inbounds @inline overload_broadcast_getindex(A::Tuple, I) = error("unhandled") # A[I[1]]
+Base.@propagate_inbounds @generated function overload_broadcast_getindex(bc::Base.Broadcast.Broadcasted, I)
+   args = Expr[]
+   for i in 1:length(bc.parameters[4].parameters)
+      push!(args, Expr(:call, overload_broadcast_getindex, :(bc.args[$i]), :I))
+   end
+   expr = Expr(:call, Base.Broadcast._broadcast_getindex_evalf, :(bc.f), args...)
+   return quote
+      Base.@_inline_meta
+      $expr
+   end
+end
 
-@inline function override_bc_materialize(bc)
+Base.@propagate_inbounds @inline overload_broadcast_getindex(A, I) = @inbounds A[I]
+
+struct OverrideBCMaterialize{ElType}
+end
+
+@inline function (::OverrideBCMaterialize{ElType})(bc) where ElType
     if bc.args isa Tuple{AbstractArray} && bc.f === Base.identity
         return copy(bc.args[1])
     end
-    ElType = Base.Broadcast.combine_eltypes(bc.f, bc.args)
-    dest = similar(bc, ElType)
-    if all(isa_array_or_number, bc.args) && same_sized(bc.args)
-        @inbounds @simd for I in 1:length(bc)
-            val = Base.Broadcast._broadcast_getindex_evalf(bc.f, map(Base.Fix2(overload_broadcast_getindex, I), bc.args)...)
+    dest = @inline similar(bc, ElType)
+    if same_sized(bc.args)
+        # dest = @inline similar(first_array(bc.args), ElType)
+	@inbounds @simd for I in 1:length(bc)
+	    val = overload_broadcast_getindex(bc, I)
             dest[I] = val
         end
+	return dest
     else
-        Base.copyto!(dest, bc)
+       # The existing code is rather slow for broadcast in practice: https://github.com/EnzymeAD/Enzyme.jl/issues/1434
+       src = @inline Base.Broadcast.preprocess(nothing, bc)
+       idx = Base.eachindex(src)
+       @inline Enzyme.Compiler.Interpreter.lindex_v3(idx, dest, src)
+       return dest
     end
-    return dest 
 end
 
 struct MultiOp{Position, NumUsed, F1, F2}
@@ -886,12 +1025,28 @@ end
     end
 end
 
-@inline function array_or_number(@nospecialize(Ty))::Bool
-    return Ty <: AbstractArray || Ty <: Number
+@inline function bc_or_array_or_number_ty(@nospecialize(Ty::Type))::Bool
+    if Ty <: Base.Broadcast.Broadcasted{<:Base.Broadcast.DefaultArrayStyle, Nothing}
+	return all(bc_or_array_or_number_ty, Ty.parameters[4].parameters)
+    else
+	return Ty <: AbstractArray || Ty <: Number || Ty <: Base.RefValue
+    end
 end
 
-@inline function isa_array_or_number(@nospecialize(x))::Bool
-    return x isa AbstractArray || x isa Number
+@inline function has_array(@nospecialize(Ty::Type))::Bool
+    if Ty <: Base.Broadcast.Broadcasted{<:Base.Broadcast.DefaultArrayStyle, Nothing}
+	return any(has_array, Ty.parameters[4].parameters)
+    else
+	return Ty <: AbstractArray
+    end
+end
+
+@generated function isa_bc_or_array_or_number(x)::Bool
+    res = bc_or_array_or_number_ty(x)
+    return quote
+       Base.@_inline_meta
+       $res
+    end
 end
 
 @inline function num_or_eltype(@nospecialize(Ty))::Type
@@ -900,6 +1055,25 @@ end
     else
         return Ty
     end
+end
+
+
+## Computation of inferred result type, for empty and concretely inferred cases only
+ty_broadcast_getindex_eltype(interp, bc::Type{<:Base.Broadcast.Broadcasted}) = ty_combine_eltypes(interp, bc.parameters[3], (bc.parameters[4].parameters...,))
+ty_broadcast_getindex_eltype(interp, A) = eltype(A)  # Tuple, Array, etc.
+
+ty_eltypes(interp, ::Tuple{}) = Tuple{}
+ty_eltypes(interp, t::Tuple{Any}) = Iterators.TupleOrBottom(ty_broadcast_getindex_eltype(interp, t[1]))
+ty_eltypes(interp, t::Tuple{Any,Any}) = Iterators.TupleOrBottom(ty_broadcast_getindex_eltype(interp, t[1]), ty_broadcast_getindex_eltype(interp, t[2]))
+ty_eltypes(interp, t::Tuple) = (TT = ty_eltypes(interp, Base.tail(t)); TT === Union{} ? Union{} : Iterators.TupleOrBottom(ty_broadcast_getindex_eltype(interp, t[1]), TT.parameters...))
+# eltypes(t::Tuple) = Iterators.TupleOrBottom(ntuple(i -> _broadcast_getindex_eltype(t[i]), Val(length(t)))...)
+
+# Inferred eltype of result of broadcast(f, args...)
+function ty_combine_eltypes(interp, f, args::Tuple)
+    argT = ty_eltypes(interp, args)
+    argT === Union{} && return Union{}
+    preprom = Core.Compiler._return_type(interp, Tuple{f, argT.parameters...})
+    return Base.promote_typejoin_union(preprom)
 end
 
 function abstract_call_known(
@@ -913,7 +1087,7 @@ function abstract_call_known(
 
     (; fargs, argtypes) = arginfo
 
-    if f === Enzyme.within_autodiff
+    if interp.within_autodiff_rewrite && f === Enzyme.within_autodiff
         if length(argtypes) != 1
             @static if VERSION < v"1.11.0-"
                 return CallMeta(Union{}, Effects(), NoCallInfo())
@@ -940,20 +1114,24 @@ function abstract_call_known(
     if interp.broadcast_rewrite
         if f === Base.materialize && length(argtypes) == 2
             bcty = widenconst(argtypes[2])
-            if Base.isconcretetype(bcty) && bcty <: Base.Broadcast.Broadcasted{<:Base.Broadcast.DefaultArrayStyle, Nothing} && all(array_or_number, bcty.parameters[4].parameters) && any(Base.Fix2(Base.:<:, AbstractArray), bcty.parameters[4].parameters)
+	    if Base.isconcretetype(bcty) && bcty <: Base.Broadcast.Broadcasted{<:Base.Broadcast.DefaultArrayStyle, Nothing} && bc_or_array_or_number_ty(bcty) && has_array(bcty)
+		ElType = ty_broadcast_getindex_eltype(interp, bcty)
+		if ElType !== Union{} && Base.isconcretetype(ElType)
+		    fn2 = Enzyme.Compiler.Interpreter.OverrideBCMaterialize{ElType}()
                     arginfo2 = ArgInfo(
                         fargs isa Nothing ? nothing :
-                        [:(Enzyme.Compiler.Interpreter.override_bc_materialize), fargs[2:end]...],
-                        [Core.Const(Enzyme.Compiler.Interpreter.override_bc_materialize), argtypes[2:end]...],
+			[:(fn2), fargs[2:end]...],
+			[Core.Const(fn2), argtypes[2:end]...],
                     )
                     return Base.@invoke abstract_call_known(
                         interp::AbstractInterpreter,
-                        Enzyme.Compiler.Interpreter.override_bc_materialize::Any,
+                        fn2::Any,
                         arginfo2::ArgInfo,
                         si::StmtInfo,
                         sv::AbsIntState,
                         max_methods::Int,
                     )
+		end
             end
         end
 

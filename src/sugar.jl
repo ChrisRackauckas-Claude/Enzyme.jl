@@ -7,17 +7,22 @@ function zerosetfn(x, i::Int)
     return res
 end
 
-@generated function onehot_internal(fn::F, x::T, startv::Int, lengthv::Int) where {F, T<:Array}
+function zerosetfn!(x, i::Int, val)
+    @inbounds x[i] += val
+    nothing
+end
+
+@generated function onehot_internal(fn::F, x::T, startv::Int, lengthv::Int) where {F, T<:AbstractArray}
     ir = GPUCompiler.JuliaContext() do ctx
         Base.@_inline_meta
 
         target = Compiler.DefaultCompilerTarget()
         params = Compiler.PrimalCompilerParams(API.DEM_ForwardMode)
-        mi = my_methodinstance(fn, Tuple{T, Int})
-        job = GPUCompiler.CompilerJob(mi, GPUCompiler.CompilerConfig(target, params; kernel = false))
+        mi = my_methodinstance(nothing, fn, Tuple{T, Int})
+        job = GPUCompiler.CompilerJob(mi, GPUCompiler.CompilerConfig(target, params; kernel = false, libraries = true, toplevel = true, optimize = false, cleanup = false, only_entry = false, validate = false))
 
         GPUCompiler.prepare_job!(job)
-        mod, meta = GPUCompiler.emit_llvm(job; libraries=true, toplevel=true, optimize=false, cleanup=false, only_entry=false, validate=false)
+        mod, meta = GPUCompiler.emit_llvm(job)
         
         copysetfn = meta.entry
         blk = first(LLVM.blocks(copysetfn))
@@ -82,7 +87,7 @@ end
         LLVM.br!(builder, LLVM.icmp!(builder, LLVM.API.LLVMIntEQ, LLVM.ConstantInt(0), len), exit, loop)
 
         LLVM.position!(builder, loop)
-        idx = LLVM.phi!(builder, ity)
+        idx = LLVM.phi!(builder, ity, "onehot.idx")
 
         push!(LLVM.incoming(idx), (LLVM.ConstantInt(0), entry))
         inc = LLVM.add!(builder, idx, LLVM.ConstantInt(1))
@@ -163,7 +168,7 @@ end
 @inline function onehot(x::NTuple{N,T}) where {T,N}
     onehot(NTuple{N,T})
 end
-@inline function onehot(x::NTuple{N,T}, start, endl) where {T,N}
+@inline function onehot(x::NTuple{N,T}, start::Int, endl::Int) where {T,N}
     ntuple(Val(endl - start + 1)) do i
         Base.@_inline_meta
         ntuple(Val(N)) do idx
@@ -175,6 +180,17 @@ end
 
 @inline function onehot(x::AbstractFloat)
     return (one(x),)
+end
+
+@inline function onehot(x::Tuple{Vararg{<:AbstractFloat}})
+    ntuple(Val(length(x))) do i
+        Base.@_inline_meta
+        ntuple(Val(length(x))) do idx
+            Base.@_inline_meta
+            T = typeof(x[idx])
+            return (i == idx) ? T(1) : T(0)
+        end
+    end
 end
 
 """
@@ -254,13 +270,13 @@ grad = gradient(ReverseWithPrimal, mul, [2.0], Const([3.0]))
 ```
 
 """
-# TODO eventually add an invalidation edge here from inactive_type
 @generated function gradient(
-    rm::ReverseMode{ReturnPrimal,RuntimeActivity,ABI,Holomorphic,ErrIfFuncWritten},
+    rm::ReverseMode{ReturnPrimal,RuntimeActivity,StrongZero,ABI,Holomorphic,ErrIfFuncWritten},
     f::F,
     x::ty_0,
     args::Vararg{Any,N},
-) where {F,ty_0,ReturnPrimal,RuntimeActivity,ABI,Holomorphic,ErrIfFuncWritten,N}
+) where {F,ty_0,ReturnPrimal,RuntimeActivity,StrongZero,ABI,Holomorphic,ErrIfFuncWritten,N}
+    # TODO eventually add an invalidation edge here from inactive_type
     rargs = Union{Symbol,Expr}[:x]
     gentys = Type[x]
     acts = Symbol[Symbol("act_0")]
@@ -384,11 +400,11 @@ gradient!(ReverseWithPrimal, dx, f, [2.0, 3.0])
 ```
 """
 @inline function gradient!(
-    rm::ReverseMode{ReturnPrimal,RuntimeActivity,ABI,Holomorphic,ErrIfFuncWritten},
+    rm::ReverseMode{ReturnPrimal,RuntimeActivity,StrongZero,ABI,Holomorphic,ErrIfFuncWritten},
     dx::X,
     f::F,
     x::X,
-) where {X<:Array,F,ReturnPrimal,RuntimeActivity,ABI,Holomorphic,ErrIfFuncWritten}
+) where {X<:Array,F,ReturnPrimal,RuntimeActivity,StrongZero,ABI,Holomorphic,ErrIfFuncWritten}
     make_zero!(dx)
     res = autodiff(rm, f, Active, Duplicated(x, dx))
     return if ReturnPrimal
@@ -482,15 +498,6 @@ end
 	res
 end
 
-@inline function tupstack(x, outshape::Tuple{Vararg{Int}}, inshape::Tuple{Vararg{Int}})
-    st = Base.stack(x)
-    if length(outshape) == 1
-        st
-    else
-        reshape(st, (outshape..., inshape...))
-    end
-end
-
 @inline specialize_output(output, input) = output
 
 """
@@ -575,13 +582,13 @@ gradient(Forward, mul, [2.0, 3.0], Const([2.7, 3.1]))
 ```
 """
 @generated function gradient(
-    fm::ForwardMode{ReturnPrimal,ABI,ErrIfFuncWritten,RuntimeActivity},
+    fm::ForwardMode{ReturnPrimal,ABI,ErrIfFuncWritten,RuntimeActivity,StrongZero},
     f::F,
     x::ty_0,
     args::Vararg{Any,N};
     chunk::CS = nothing,
     shadows::ST = create_shadows(chunk, x, args...),
-) where {F, ReturnPrimal,ABI,ErrIfFuncWritten,RuntimeActivity,CS,ST, ty_0, N}
+) where {F, ReturnPrimal,ABI,ErrIfFuncWritten,RuntimeActivity,StrongZero,CS,ST, ty_0, N}
 
     syms = Union{Symbol,Expr}[:x]
     shads = Union{Symbol,Expr}[:(shadows[1])]
@@ -739,12 +746,14 @@ gradient(Forward, mul, [2.0, 3.0], Const([2.7, 3.1]))
                 if argnum > 0
                     quote
                         if $tmp[1] isa AbstractArray
-                            inshape = size($(vals[1]))
+                            inshape = size($(vals[i]))
                             outshape = size($tmp[1])
+                            num = prod(outshape)
+
                             # st : outshape x total inputs
                             tupstack($tmp, outshape, inshape)
                         else
-                            specialize_output(TupleArray($tmp, size($arg)), $(vals[1]))
+                            specialize_output(TupleArray($tmp, size($arg)), $(vals[i]))
                         end
                     end
                 else
@@ -782,6 +791,380 @@ Equivalent to gradient(::ForwardMode, args...; kwargs...)
 """
 @inline function jacobian(fm::ForwardMode, args...; kwargs...)
     gradient(fm, args...; kwargs...)
+end
+
+@generated function jacobian_helper(
+    mode::ReverseMode{ReturnPrimal},
+    RT::RType,
+    n_outs::OutType,
+    chunk::CT,
+    f::F,
+    xs::Vararg{Any, Nargs}
+) where {ReturnPrimal,RType, F,Nargs,OutType,CT}
+    fty = if f <: Enzyme.Annotation
+        f.parameters[1]
+    else
+        f
+    end
+
+    primval = if f <: Enzyme.Annotation
+        :(f.val)
+    else
+        :f
+    end
+
+    constargs = []
+    consttys = []
+    for (i, T) in enumerate(xs)
+        if T <: Enzyme.Annotation
+            push!(consttys, T.parameters[1])
+            push!(constargs, :(xs[$i].val))
+        else
+            push!(consttys, T)
+            push!(constargs, :(xs[$i]))
+        end
+    end
+
+    callprim = Expr(:call, primval, constargs...)
+
+    if length(xs) == 0
+        if ReturnPrimal
+            return quote
+                Base.@_inline_meta
+                (; derivs = (), val = $callprim)
+            end
+        else
+            return quote
+                Base.@_inline_meta
+                ()
+            end
+        end
+    end
+
+    noutsexpr = :n_outs
+
+    exprs = Expr[]
+    if n_outs == Nothing
+        if RT <: AbstractFloat
+            return quote
+                Base.@_inline_meta
+                gradient(
+                    mode,
+                    f,
+                    xs...,
+                )
+            end
+        end
+
+        return quote
+            Base.@_inline_meta
+            res = $callprim
+            jac = if res isa AbstractArray
+                jacobian_helper(
+                    NoPrimal(mode),
+                    RT,
+                    Val(size(res)),
+                    chunk,
+                    f,
+                    xs...
+                )
+            elseif res isa AbstractFloat
+                gradient(
+                    NoPrimal(mode),
+                    f,
+                    xs...,
+                )
+            else
+                throw(
+                    AssertionError(
+                        "Unsupported return type of function for reverse-mode jacobian, $(Core.Typeof(res))",
+                    ),
+                )
+            end
+
+            return if ReturnPrimal
+                (; derivs = jac, val = res)
+            else
+                jac
+            end
+        end
+    end
+
+    if chunk == Val{0}
+        return quote
+            throw(ErrorException("Cannot differentiate with a batch size of 0"))
+        end
+    end
+
+    @assert n_outs <: Val
+    nouts2 = n_outs.parameters[1]
+
+    n_out_val = if length(nouts2) == 0
+        0
+    else
+        prod(nouts2)
+    end
+
+    exprs = Expr[]
+    XTs = Symbol[]
+    MDs = Symbol[]
+    MDTys = Union{Expr,Symbol}[]
+    MDTysLast = Union{Expr,Symbol}[]
+
+    chunksize = if chunk <: Val
+        chunk.parameters[1]
+    else
+        1
+    end
+    num = ((n_out_val + chunksize - 1) ÷ chunksize)
+
+    last_size = if num * chunksize == n_out_val
+        chunksize
+    else
+        n_out_val - (num - 1) * chunksize
+    end
+
+    for i in 1:length(xs)
+        xti = Symbol("XT_", i)
+        push!(XTs, xti)
+        mdi = Symbol("MD_", i)
+        push!(MDs, mdi)
+
+        push!(exprs, Expr(:(=), xti, :(Core.Typeof(xs[$i]))))
+
+        if xs[i] <: Const
+            push!(exprs, Expr(:(=), mdi, false))
+            push!(MDTys, xti)
+            push!(MDTysLast, xti)
+        else
+            push!(exprs, Expr(:(=), mdi, :(Compiler.active_reg_inner($xti, (), nothing, Val(true)) == Compiler.ActiveState)))
+
+            if chunk == Val{1} || chunk == Nothing
+                push!(MDTys, :($mdi ? MixedDuplicated{$xti} : Duplicated{$xti}))
+            else
+                push!(MDTys, :($mdi ? BatchMixedDuplicated{$xti, $chunksize} : BatchDuplicated{$xti, $chunksize}))
+                if last_size == 1
+                    push!(MDTysLast, :($mdi ? MixedDuplicated{$xti} : Duplicated{$xti}))
+                else
+                    push!(MDTysLast, :($mdi ? BatchMixedDuplicated{$xti, $last_size} : BatchDuplicated{$xti, $last_size}))
+                end
+            end
+        end
+    end
+
+    ModifiedBetween = ntuple(Returns(false), length(xs)+1)
+
+    cst_fn = if f <: Enzyme.Annotation
+        :f
+    else
+        :(Const(f))
+    end
+
+    postexprs = Expr[]
+
+    torows = Matrix{Union{Expr, Nothing}}(undef, n_out_val, length(xs))
+
+
+    curidx = 1
+    for i in 1:num
+
+        batchcnt = if i == num
+            last_size
+        else
+            chunksize
+        end
+
+        args = []
+        dxs = Symbol[]
+        for j in 1:length(xs)
+            if xs[j] <: Enzyme.Const
+                push!(args, :(xs[$j]))
+                push!(dxs, :undefined)
+                continue
+            end
+
+            dx = Symbol("dx_", curidx, "_", j)
+
+            e0 = :(make_zero(xs[$j]))
+
+            if batchcnt == 1
+                zsym = Symbol("zero_", curidx, "_", j)
+                push!(postexprs, Expr(:(=), zsym, e0))
+                push!(postexprs, Expr(:(=), dx, :($(MDs[j]) ? Ref($zsym) : $zsym)))
+            else
+                eexprs = Expr[]
+                for b in 1:batchcnt
+                    zsym = Symbol("zero_", curidx, "_", j, "_", b)
+                    push!(postexprs, Expr(:(=), zsym, e0))
+                    push!(eexprs, :($(MDs[j]) ? Ref($zsym) : $zsym))
+                end
+                tup = Expr(:tuple, eexprs...)
+                push!(postexprs, Expr(:(=), dx, tup))
+            end
+
+            push!(dxs, dx)
+            if batchcnt == 1
+                push!(args, :($(MDs[j]) ? MixedDuplicated(xs[$j], $dx) : Duplicated(xs[$j], $dx)))
+            else
+                push!(args, :($(MDs[j]) ? BatchMixedDuplicated(xs[$j], $dx) : BatchDuplicated(xs[$j], $dx)))
+            end
+        end
+
+        ressym = Symbol("res_", curidx)
+        push!(postexprs, Expr(:(=), ressym, Expr(:call, (chunksize != 1 && i == num) ? :primal2 : :primal, cst_fn, args...)))
+
+        if batchcnt == 1
+            push!(postexprs, :(zerosetfn!($ressym[3], $curidx, Compiler.default_adjoint(eltype(typeof($ressym[3]))))))
+        else
+            for k in 1:batchcnt
+                push!(postexprs, :(zerosetfn!($ressym[3][$k], $(curidx+k-1), Compiler.default_adjoint(eltype(typeof($ressym[3][$k]))))))
+            end
+        end
+
+        push!(postexprs, Expr(:call, (chunksize != 1 && i == num) ? :adjoint2 : :adjoint, cst_fn, args..., :($ressym[1])))
+
+        if curidx == 1
+            if batchcnt == 1
+                push!(postexprs,
+                    Expr(:(=), :outshape, :(size($ressym[3])))
+                )
+            else
+                push!(postexprs,
+                    Expr(:(=), :outshape, :(size($ressym[3][1])))
+                )
+            end
+        end
+
+        for j in 1:length(xs)
+            if batchcnt == 1
+                if xs[j] <: Enzyme.Const
+                    torows[curidx, j] = nothing
+                else
+                    torows[curidx, j] = :($(MDs[j]) ? $(dxs[j])[] : $(dxs[j]))
+                end
+            else
+                for k in 1:batchcnt
+                    if xs[j] <: Enzyme.Const
+                        torows[curidx+k-1, j] = nothing
+                    else
+                        torows[curidx+k-1, j] = :($(MDs[j]) ? $(dxs[j])[$k][] : $(dxs[j])[$k])
+                    end
+                end
+            end
+        end
+
+        curidx += batchcnt
+    end
+
+    results = []
+
+
+    for j in 1:length(xs)
+        if xs[j] <: Enzyme.Const
+            push!(results, nothing)
+            continue
+        end
+        if xs[j] <: AbstractArray
+            inshape = Symbol("inshape_", j)
+            push!(postexprs, Expr(:(=), inshape, :(size(xs[$j]))))
+
+            resj = Symbol("tempres_", j)
+            push!(postexprs, Expr(:(=), resj, :(Array{$(eltype(xs[j]))}(undef, $(inshape)..., outshape...))))
+
+            numv = Symbol("num_", j)
+            push!(postexprs, Expr(:(=), numv, :(prod($inshape))))
+
+            for i in 1:n_out_val
+                push!(postexprs, Expr(:call, :(Base.unsafe_copyto!), resj, :($numv*($i-1)+1), torows[i, j], 1, :(Base.reinterpret(UInt, $numv))))
+            end
+
+            push!(results, quote
+                if length(outshape) == 1 && length($inshape) == 1
+                    transpose($resj)
+                else
+                    transp = (
+                        ((length($inshape)+1):(length($inshape)+length(outshape)))...,
+                        (1:length($inshape))...,
+                    )
+                    PermutedDimsArray($resj, transp)
+                end
+            end)
+        else
+            push!(results, :(reshape($(xs[j])[$(torows[:, j]...)], outshape)))
+        end
+    end
+
+
+    if ReturnPrimal
+        # TODO optimize away redundant fwd pass
+        push!(postexprs, quote
+            derivs = ($(results...),)
+            return (; derivs = derivs, val = $callprim)
+        end)
+    else
+        push!(postexprs, quote
+            return ($(results...),)
+        end)
+    end
+
+    prim2 = if chunksize == 1
+        quote end
+    else
+        if num * chunksize == n_out_val
+            quote
+                primal2, adjoint2 = primal, adjoint
+            end    
+        else
+            BNN2 = if last_size == 1
+                :(DuplicatedNoNeed{RT})
+            else
+                :(BatchDuplicatedNoNeed{RT, $last_size})
+            end 
+            quote
+                primal2, adjoint2 = autodiff_thunk(
+                    EnzymeCore.Split(EnzymeCore.NoPrimal(mode),
+                        #=ReturnShadow=#Val(true),
+                        #=Width=#Val($last_size),
+                        #=ModifiedBetween=#Val(ModifiedBetweenT),
+                        #=ShadowInit=#Val(false)
+                    ),
+                    FA,
+                    $BNN2,
+                    $(MDTysLast...)
+                )
+            end
+        end
+    end
+
+    DRT = if chunksize == 1
+        :(DuplicatedNoNeed{RT})
+    else
+        :(BatchDuplicatedNoNeed{RT, $chunksize})
+    end
+
+    return quote
+        Base.@_inline_meta
+        $(exprs...)
+
+        ModifiedBetweenT = $ModifiedBetween
+        FA = Core.Typeof($cst_fn)
+
+        primal, adjoint = autodiff_thunk(
+            EnzymeCore.Split(EnzymeCore.NoPrimal(mode),
+                #=ReturnShadow=#Val(true),
+                #=Width=#Val($chunksize),
+                #=ModifiedBetween=#Val(ModifiedBetweenT),
+                #=ShadowInit=#Val(false)
+            ),
+            FA,
+            $DRT,
+            $(MDTys...)
+        )
+
+        $prim2
+
+        $(postexprs...)
+    end
 end
 
 """
@@ -838,210 +1221,33 @@ In the future, when this function is extended to handle non-array return types,
 this function will retun an AbstractArray of shape `size(output)` of values of the input type. 
 ```
 """
-@inline function jacobian(
-    mode::ReverseMode{ReturnPrimal,RuntimeActivity,RABI,Holomorphic,ErrIfFuncWritten},
+@generated function jacobian(
+    mode::ReverseMode,
     f::F,
-    x::X;
+    xs::Vararg{Any, Nargs};
     n_outs::OutType = nothing,
     chunk::CT = nothing,
-) where {ReturnPrimal,F,X,RABI<:ABI,ErrIfFuncWritten,RuntimeActivity,OutType,CT,Holomorphic}
+) where {F,Nargs, OutType,CT}
 
-    if n_outs == nothing
-        res = if f isa Const
-            f.val(x)
-        else
-            f(x)
-        end
-        jac = if res isa AbstractArray
-            jacobian(
-                ReverseMode{false,RuntimeActivity,RABI,Holomorphic,ErrIfFuncWritten}(),
-                f,
-                x;
-                n_outs = Val(size(res)),
-                chunk,
-            )
-        elseif res isa AbstractFloat
-            gradient(
-                ReverseMode{false,RuntimeActivity,RABI,Holomorphic,ErrIfFuncWritten}(),
-                f,
-                x,
-            )
-        else
-            throw(
-                AssertionError(
-                    "Unsupported return type of function for reverse-mode jacobian, $(Core.Typeof(res))",
-                ),
-            )
-        end
-
-        return if ReturnPrimal
-            (; derivs = jac, val = res)
-        else
-            jac
-        end
+    fty = if f <: Enzyme.Annotation
+        f.parameters[1]
     else
-        n_out_val = if length(Compiler.element(n_outs)) == 0
-            0
+        f
+    end
+
+    consttys = []
+    for (i, T) in enumerate(xs)
+        if T <: Enzyme.Annotation
+            push!(consttys, T.parameters[1])
         else
-            prod(Compiler.element(n_outs))
+            push!(consttys, T)
         end
+    end
 
-        if chunk == Val(0)
-            throw(ErrorException("Cannot differentiate with a batch size of 0"))
-        end
-
-        XT = Core.Typeof(x)
-        MD = Compiler.active_reg_inner(XT, (), nothing, Val(true)) == Compiler.ActiveState #=justActive=#
-        tt = Tuple{XT}
-        FRT = if f isa Const
-            Core.Typeof(f.val)
-        else
-            Core.Typeof(f)
-        end
-
-        rt = Compiler.primal_return_type(mode, FRT, tt)
-
-        ModifiedBetweenT = (false, false)
-        FA = Const{FRT}
-
-        if chunk == Val(1) || chunk == nothing
-            primal, adjoint = autodiff_thunk(
-                ReverseModeSplit{
-                    #=ReturnPrimal=#false,
-                    #=ReturnShadow=#true,
-                    RuntimeActivity,
-                    #=width=#1,
-                    ModifiedBetweenT,
-                    RABI,
-                    Holomorphic,
-                    ErrIfFuncWritten,
-                    #=ShadowInit=#false
-                }(),
-                FA,
-                DuplicatedNoNeed{rt},
-                MD ? MixedDuplicated{XT} : Duplicated{XT}
-            )
-            tmp = ntuple(Val(n_out_val)) do i
-                Base.@_inline_meta
-                z = make_zero(x)
-                dx = MD ? Ref(z) : z
-                res = primal(Const(f), MD ? MixedDuplicated(x, dx) : Duplicated(x, dx))
-                tape = res[1]
-                @inbounds res[3][i] += Compiler.default_adjoint(eltype(typeof(res[3])))
-                adjoint(Const(f), MD ? MixedDuplicated(x, dx) : Duplicated(x, dx), tape)
-                return MD ? dx[] : dx, (i == 1 ? size(res[3]) : nothing)
-            end
-            rows = map(first, tmp)
-            outshape = tmp[1][2]
-            rows, outshape
-        else
-            chunksize = Compiler.element(chunk)
-            primal, adjoint = autodiff_thunk(
-                ReverseModeSplit{
-                    #=ReturnPrimal=#false,
-                    #=ReturnShadow=#true,
-                    RuntimeActivity,
-                    chunksize,
-                    ModifiedBetweenT,
-                    RABI,
-                    Holomorphic,
-                    ErrIfFuncWritten,
-                    #=ShadowInit=#false
-                }(),
-                FA,
-                BatchDuplicatedNoNeed{rt, chunksize},
-                MD ? BatchMixedDuplicated{XT, chunksize} : BatchDuplicated{XT, chunksize}
-            )
-
-            num = ((n_out_val + chunksize - 1) ÷ chunksize)
-
-            if num * chunksize == n_out_val
-                last_size = chunksize
-                primal2, adjoint2 = primal, adjoint
-            else
-                last_size = n_out_val - (num - 1) * chunksize
-                tt′ = Tuple{BatchDuplicated{Core.Typeof(x),last_size}}
-                primal2, adjoint2 = autodiff_thunk(
-                    ReverseModeSplit{
-                        #=ReturnPrimal=#false,
-                        #=ReturnShadow=#true,
-                        RuntimeActivity,
-                        last_size,
-                        ModifiedBetweenT,
-                        RABI,
-                        Holomorphic,
-                        ErrIfFuncWritten,
-                        #=ShadowInit=#false
-                    }(),
-                    FA,
-                    BatchDuplicatedNoNeed{rt, last_size},
-                    MD ? BatchMixedDuplicated{XT, last_size} : BatchDuplicated{XT, last_size}
-                )
-            end
-
-            tmp = ntuple(num) do i
-                Base.@_inline_meta
-                dx = ntuple(Val(i == num ? last_size : chunksize)) do idx
-                    Base.@_inline_meta
-                    z = make_zero(x)
-                    MD ? Ref(z) : z
-                end
-                res = (i == num ? primal2 : primal)(
-                    Const(f),
-                    MD ? BatchMixedDuplicated(x, dx) : BatchDuplicated(x, dx),
-                )
-                tape = res[1]
-                j = 0
-                for shadow in res[3]
-                    j += 1
-                    @inbounds shadow[(i-1)*chunksize+j] +=
-                        Compiler.default_adjoint(eltype(typeof(shadow)))
-                end
-                (i == num ? adjoint2 : adjoint)(
-                    Const(f),
-                    MD ? BatchMixedDuplicated(x, dx) : BatchDuplicated(x, dx),
-                    tape,
-                )
-                return MD ? (
-                    ntuple(Val(i == num ? last_size : chunksize)) do idx
-                        Base.@_inline_meta
-                        dx[idx][]
-                    end
-                ) : dx,
-                (i == 1 ? size(res[3][1]) : nothing)
-            end
-            rows = tupleconcat(map(first, tmp)...)
-            outshape = tmp[1][2]
-            rows, outshape
-        end
-        res = if x isa AbstractArray
-            inshape = size(x)
-            st2 = tupstack(rows, inshape, outshape)
-
-            st3 = if length(outshape) == 1 && length(inshape) == 1
-                transpose(st2)
-            else
-                transp = (
-                    ((length(inshape)+1):(length(inshape)+length(outshape)))...,
-                    (1:length(inshape))...,
-                )
-                PermutedDimsArray(st2, transp)
-            end
-
-            st3
-        else
-            reshape(collect(rows), outshape)
-        end
-        if ReturnPrimal
-            # TODO optimize away redundant fwd pass
-            (; derivs = (res,), val = if f isa Enzyme.Const
-                f.val(x)
-            else
-                f(x)
-            end)
-        else
-            (res,)
-        end
+    return quote
+        Base.@_inline_meta
+        RT = Compiler.primal_return_type(Reverse, $fty, $(Tuple{consttys...}))
+        return @inline jacobian_helper(mode, RT, n_outs, chunk, f, xs...)
     end
 end
 
@@ -1154,4 +1360,3 @@ grad
     )
     return nothing
 end
-

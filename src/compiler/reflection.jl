@@ -1,8 +1,11 @@
+import GPUCompiler
+
 function get_job(
     @nospecialize(func),
     @nospecialize(A),
     @nospecialize(types);
     run_enzyme::Bool = true,
+    optimize::Bool = true,
     mode::API.CDerivativeMode = API.DEM_ReverseModeCombined,
     dupClosure::Bool = false,
     argwrap::Bool = true,
@@ -13,19 +16,21 @@ function get_job(
     world = nothing,
     ABI = DefaultABI,
     ErrIfFuncWritten = false,
-    RuntimeActivity = true,
+    RuntimeActivity = false,
+    StrongZero = false,
     kwargs...,
 )
 
     tt = Tuple{map(eltype, types.parameters)...}
 
-
-    primal, rt = if world isa Nothing
-        fspec(Core.Typeof(func), types), Compiler.primal_return_type(mode == API.DEM_ForwardMode ? Forward : Reverse, Core.Typeof(func), tt)
-    else
-        fspec(Core.Typeof(func), types, world), Compiler.primal_return_type_world(mode == API.DEM_ForwardMode ? Forward : Reverse, world, Core.Typeof(func), tt)
+    if world isa Nothing
+        world=Base.get_world_counter()
     end
 
+    primal = my_methodinstance(mode == API.DEM_ForwardMode ? Forward : Reverse, Core.Typeof(func), tt, world)
+    rt = Compiler.primal_return_type_world(mode == API.DEM_ForwardMode ? Forward : Reverse, world, Core.Typeof(func), tt)
+
+    @assert primal !== nothing
     rt = A{rt}
     target = Compiler.EnzymeTarget()
     if modifiedBetween === nothing
@@ -46,19 +51,13 @@ function get_job(
         ABI,
         ErrIfFuncWritten,
         RuntimeActivity,
+        StrongZero
     )
-    if world isa Nothing
-        return Compiler.CompilerJob(
-            primal,
-            CompilerConfig(target, params; kernel = false),
-        )
-    else
-        return Compiler.CompilerJob(
+    return GPUCompiler.CompilerJob(
             primal,
             CompilerConfig(target, params; kernel = false),
             world,
         )
-    end
 end
 
 function reflect(
@@ -70,9 +69,9 @@ function reflect(
     kwargs...,
 )
 
-    job = get_job(func, A, types; kwargs...)
+    job = get_job(func, A, types; optimize, kwargs...)
     # Codegen the primal function and all its dependency in one module
-    mod, meta = Compiler.codegen(:llvm, job; optimize) #= validate=false =#
+    mod, meta = GPUCompiler.codegen(:llvm, job) #= validate=false =#
 
     if second_stage
         post_optimze!(mod, JIT.get_tm())
@@ -101,6 +100,16 @@ function enzyme_code_llvm(
     dump_module::Bool = false,
     mode = API.DEM_ReverseModeCombined,
 )
+    if mode == API.DEM_ForwardMode
+        if A <: Active
+            throw(AssertionError("Active not allowed in forward mode"))
+        end
+        for T in types.parameters
+            if T <: Active
+                throw(AssertionError("Active not allowed in forward mode"))
+            end
+        end
+    end
     JuliaContext() do ctx
         entry_fn, ir = reflect(func, A, types; optimize, run_enzyme, second_stage, mode)
         ts_mod = ThreadSafeModule(ir)

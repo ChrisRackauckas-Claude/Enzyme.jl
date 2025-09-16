@@ -199,7 +199,55 @@ function emit_jl_throw!(B::LLVM.IRBuilder, @nospecialize(val::LLVM.Value))::LLVM
     T_prjlvalue = LLVM.PointerType(T_jlvalue, 12)
     FT = LLVM.FunctionType(T_void, [T_prjlvalue])
     fn, _ = get_function!(mod, "jl_throw", FT)
-    call!(B, FT, fn, LLVM.Value[val])
+    cb = call!(B, FT, fn, LLVM.Value[val])
+    LLVM.API.LLVMAddCallSiteAttribute(
+		cb,
+		reinterpret(LLVM.API.LLVMAttributeIndex, LLVM.API.LLVMAttributeFunctionIndex),
+		EnumAttribute("noreturn"),
+	    )
+    return cb
+end
+
+function emit_conditional_throw!(B::LLVM.IRBuilder, @nospecialize(cond::LLVM.Value), @nospecialize(errty::Type), @nospecialize(str::LLVM.Value))::LLVM.Value
+    curent_bb = position(B)
+    fn = LLVM.parent(curent_bb)
+    mod = LLVM.parent(fn)
+    T_void = LLVM.VoidType()
+    T_jlvalue = LLVM.StructType(LLVMType[])
+    T_prjlvalue = LLVM.PointerType(T_jlvalue, 10)
+    strty = LLVM.PointerType(LLVM.Int8Type())
+    FT = LLVM.FunctionType(T_void, [strty, LLVM.IntType(1)])
+
+    name = "jl_conditional_throw_"*string(errty)
+    if haskey(functions(mod), name)
+        fn = functions(mod)[name]
+    else
+        fn = LLVM.Function(mod, name, FT)
+    	linkage!(fn, LLVM.API.LLVMInternalLinkage)
+        rstr, rcond = LLVM.parameters(fn)
+	 builder = LLVM.IRBuilder()
+         entry = BasicBlock(fn, "entry")
+         errb = BasicBlock(fn, "err")
+         exitb = BasicBlock(fn, "errb")
+         position!(builder, entry)
+	 br!(builder, rcond, errb, exitb)
+         position!(builder, errb)
+
+        err = emit_allocobj!(builder, errty)
+        err2 = bitcast!(builder, err, LLVM.PointerType(LLVM.PointerType(LLVM.Int8Type()), 10))
+        err2 = addrspacecast!(builder, err2, LLVM.PointerType(LLVM.PointerType(LLVM.Int8Type()), Derived))
+        store!(builder, rstr, err2)
+
+    	 err = addrspacecast!(builder, err, LLVM.PointerType(T_jlvalue, 12))
+	   thrown = emit_jl_throw!(builder, err)
+	 unreachable!(builder)
+	 position!(builder, exitb)
+	 ret!(builder)
+
+        push!(LLVM.function_attributes(fn), LLVM.EnumAttribute("alwaysinline", 0))
+    end
+
+    call!(B, FT, fn, LLVM.Value[str, cond])
 end
 
 function emit_box_int32!(B::LLVM.IRBuilder, @nospecialize(val::LLVM.Value))::LLVM.Value
@@ -366,11 +414,18 @@ function val_from_byref_if_mixed(B::LLVM.IRBuilder, gutils::GradientUtils, @nosp
     end
 end
 
-function ref_if_mixed(val::VT) where {VT}
-    if active_reg_inner(Core.Typeof(val), (), nothing, Val(true)) == ActiveState
-        return Ref(val)
+@generated function ref_if_mixed(val::VT) where VT
+    areg = active_reg_inner(VT, (), nothing, Val(true)) 
+    if areg == ActiveState || areg == MixedState
+        quote
+            Base.@_inline_meta
+            Ref(val)
+        end
     else
-        return val
+        quote
+            Base.@_inline_meta
+            val
+        end
     end
 end
 
@@ -380,15 +435,13 @@ function byref_from_val_if_mixed(B::LLVM.IRBuilder, @nospecialize(val::LLVM.Valu
     if !legal
         legal, TT, _ = abs_typeof(val, true)
         act = active_reg_inner(TT, (), world)
-        if act == AnyState
+        if legal && act == AnyState
             return val
         end
-        if !legal
-            return emit_apply_generic!(B, [unsafe_to_llvm(B, ref_if_mixed), val]) 
-        end
+        return emit_apply_generic!(B, LLVM.Value[unsafe_to_llvm(B, ref_if_mixed), val]) 
     end
     act = active_reg_inner(TT, (), world)
-
+    
     if act == ActiveState || act == MixedState
         obj = emit_allocobj!(B, Base.RefValue{TT})
         lty = convert(LLVMType, TT)
@@ -999,26 +1052,54 @@ function allocate_sret!(gutils::API.EnzymeGradientUtilsRef, @nospecialize(N::LLV
     allocate_sret!(B, N)
 end
 
-function emit_error(B::LLVM.IRBuilder, @nospecialize(orig::Union{Nothing, LLVM.Instruction}), string::String, @nospecialize(errty::Type) = EnzymeRuntimeException)
+function emit_printf(B::LLVM.IRBuilder, string::String, v::LLVM.Value...)
     curent_bb = position(B)
     fn = LLVM.parent(curent_bb)
     mod = LLVM.parent(fn)
 
-    if !isa(string, LLVM.Value)
-        string = globalstring_ptr!(B, string, "enz_exception")
+    string = globalstring_ptr!(B, string, "enz_printf")
+    vt = LLVM.VoidType()
+    args = LLVM.Value[string, v...]
+    for i in 1:length(args)
+        if value_type(args[i]) isa LLVM.PointerType
+            if LLVM.addrspace(value_type(args[i])) == 10
+                args[i] = addrspacecast!(B, args[i], LLVM.PointerType(eltype(value_type(args[i])), 11))
+            end
+            if LLVM.addrspace(value_type(args[i])) == 11
+                args[i] = emit_pointerfromobjref!(B, args[i])
+            end
+        end
+    end
+    exc, _ = get_function!(mod, "printf", LLVM.FunctionType(vt, [value_type(string)], ;vararg=true))
+    call!(B, LLVM.function_type(exc), exc, args)
+end
+
+function emit_error(B::LLVM.IRBuilder, @nospecialize(orig::Union{Nothing, LLVM.Instruction}), string::Union{String, LLVM.Value, Tuple{String, Core.MethodInstance, UInt}}, @nospecialize(errty::Type) = EnzymeRuntimeException, @nospecialize(cond::Union{Nothing, LLVM.Value}) = nothing)
+    curent_bb = position(B)
+    fn = LLVM.parent(curent_bb)
+    mod = LLVM.parent(fn)
+
+    stringv = string
+    if stringv isa Tuple
+	stringv = stringv[1]
+    end
+    if !isa(stringv, LLVM.Value)
+        stringv = globalstring_ptr!(B, stringv, "enz_exception")
     end
 
     ct = if occursin("ptx", LLVM.triple(mod)) || occursin("amdgcn", LLVM.triple(mod))
-
+	if string isa Tuple
+	    errty = errty.name.wrapper{Nothing, Nothing}
+	end
         vt = LLVM.VoidType()
         ptr = convert(LLVMType, Ptr{Cvoid})
 
         exc, _ =
             get_function!(mod, "gpu_report_exception", LLVM.FunctionType(vt, [ptr]))
 
-        string = ptrtoint!(B, string, ptr)
+        stringv = ptrtoint!(B, stringv, ptr)
 
-        call!(B, LLVM.function_type(exc), exc, [string])
+        call!(B, LLVM.function_type(exc), exc, [stringv])
 
         framefn, ft = get_function!(
             mod,
@@ -1053,27 +1134,47 @@ function emit_error(B::LLVM.IRBuilder, @nospecialize(orig::Union{Nothing, LLVM.I
         end
         call!(B, trap_ft, trap)
     else
-        err = emit_allocobj!(B, errty)
-        err2 = bitcast!(B, err, LLVM.PointerType(LLVM.PointerType(LLVM.Int8Type()), 10))
-        store!(B, string, err2)
-        emit_jl_throw!(
-            B,
-            addrspacecast!(B, err, LLVM.PointerType(LLVM.StructType(LLVMType[]), 12)),
-        )
+    	if cond !== nothing
+	    if string isa Tuple
+	       errty = errty.name.wrapper{Nothing, Nothing}
+	    end
+            emit_conditional_throw!(B, cond, errty, stringv)
+    	else
+            err = emit_allocobj!(B, errty)
+            err2 = bitcast!(B, err, LLVM.PointerType(LLVM.PointerType(LLVM.Int8Type()), 10))
+            err2 = addrspacecast!(B, err2, LLVM.PointerType(LLVM.PointerType(LLVM.Int8Type()), Derived))
+            store!(B, stringv, err2)
+	    if string isa Tuple
+	       g1 = LLVM.inbounds_gep!(B, LLVM.PointerType(LLVM.Int8Type()), err2, [LLVM.ConstantInt(1)])
+	       ts = unsafe_to_llvm(B, string[2])
+	       g1 = LLVM.bitcast!(B, g1, LLVM.PointerType(value_type(ts), Derived))
+	       store!(B, ts, g1)
+	       g2 = LLVM.inbounds_gep!(B, LLVM.PointerType(LLVM.Int8Type()), err2, [LLVM.ConstantInt(2)])
+	       ts = LLVM.ConstantInt(string[3])
+	       g2 = LLVM.bitcast!(B, g2, LLVM.PointerType(value_type(ts), Derived))
+	       store!(B, ts, g2)
+	    end
+    		emit_jl_throw!(
+    		    B,
+    		    addrspacecast!(B, err, LLVM.PointerType(LLVM.StructType(LLVMType[]), 12)),
+    		)
+    	end
     end
 
     # 2. Call error function and insert unreachable
-    LLVM.API.LLVMAddCallSiteAttribute(
-        ct,
-        reinterpret(LLVM.API.LLVMAttributeIndex, LLVM.API.LLVMAttributeFunctionIndex),
-        EnumAttribute("noreturn"),
-    )
-    if EnzymeMutabilityException != errty
-        LLVM.API.LLVMAddCallSiteAttribute(
-            ct,
-            reinterpret(LLVM.API.LLVMAttributeIndex, LLVM.API.LLVMAttributeFunctionIndex),
-            StringAttribute("enzyme_error"),
-        )
+    if cond === nothing
+	    LLVM.API.LLVMAddCallSiteAttribute(
+		ct,
+		reinterpret(LLVM.API.LLVMAttributeIndex, LLVM.API.LLVMAttributeFunctionIndex),
+		EnumAttribute("noreturn"),
+	    )
+	    if EnzymeMutabilityException != errty
+		LLVM.API.LLVMAddCallSiteAttribute(
+		    ct,
+		    reinterpret(LLVM.API.LLVMAttributeIndex, LLVM.API.LLVMAttributeFunctionIndex),
+		    StringAttribute("enzyme_error"),
+		)
+	    end
     end
     return ct
 end

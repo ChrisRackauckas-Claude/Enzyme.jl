@@ -282,6 +282,43 @@ end
     end
 end
 
+function two_blas(a, b)
+  a = copy(a)
+  @inline LinearAlgebra.LAPACK.potrf!('L', a)
+  @inline LinearAlgebra.LAPACK.potrf!('L', b)
+  return a[1,1] + b[1,1]
+end
+
+@testset "Forward Mode runtime activity" begin
+
+  a = [2.7 3.5; 7.4 9.2]
+  da = [7.2 5.3; 4.7 2.9]
+
+  b = [3.1 5.6; 13 19]
+  db = [1.3 6.5; .13 .19]
+  
+  res = Enzyme.autodiff(Forward, two_blas, Duplicated(a, da), Duplicated(b, db))[1]
+  @test res ≈ 2.5600654222812564
+
+  a = [2.7 3.5; 7.4 9.2]
+  da = [7.2 5.3; 4.7 2.9]
+
+  b = [3.1 5.6; 13 19]
+  db = [1.3 6.5; .13 .19]
+
+  res = Enzyme.autodiff(set_runtime_activity(Forward), two_blas, Duplicated(a, da), Duplicated(b, db))[1]
+  @test res ≈ 2.5600654222812564
+
+  a = [2.7 3.5; 7.4 9.2]
+  da = [7.2 5.3; 4.7 2.9]
+
+  b = [3.1 5.6; 13 19]
+  db = [1.3 6.5; .13 .19]
+
+  @test_throws Enzyme.Compiler.EnzymeNoDerivativeError Enzyme.autodiff(set_runtime_activity(Forward), two_blas, Duplicated(a, da), Duplicated(b, b))
+
+end
+
 @testset "Cholesky" begin
     function symmetric_definite(n :: Int=10)
         α = one(Float64)
@@ -714,21 +751,21 @@ end
     # @test Enzyme.autodiff(Reverse, (x, y) -> begin y[] = f4(x); nothing end,  Active(0.1), BatchDuplicated(Ref(0.0), (Ref(1.0), Ref(2.0)))) == (((0.0,0.0)),)
 end
 
-@testset "SparseArrays spmatvec reverse rule" begin
-    C = zeros(18)
-    M = sprand(18, 9, 0.1)
-    v = randn(9)
-    α = 2.0
-    β = 1.0
+function test_sparse(M, v, α, β)
+    tout = promote_type(eltype(M), eltype(v), typeof(α), typeof(β))
+    if v isa AbstractVector
+        C = zeros(tout, size(M, 1))
+    else
+        C = zeros(tout, size(M, 1), size(v, 2))
+    end
+
 
     for Tret in (Duplicated, BatchDuplicated), TM in (Const, Duplicated, BatchDuplicated), Tv in (Const, Duplicated, BatchDuplicated), 
         Tα in (Const, Active), Tβ in (Const, Active)
 
         are_activities_compatible(Tret, Tret, TM, Tv, Tα, Tβ) || continue
         test_reverse(LinearAlgebra.mul!, Tret, (C, Tret), (M, TM), (v, Tv), (α, Tα), (β, Tβ))
-
     end
-
 
     for Tret in (Duplicated, BatchDuplicated), TM in (Const, Duplicated, BatchDuplicated), 
         Tv in (Const, Duplicated, BatchDuplicated), bα in (true, false), bβ in (true, false)
@@ -736,39 +773,60 @@ end
         test_reverse(LinearAlgebra.mul!, Tret, (C, Tret), (M, Const), (v, Tv), (bα, Const), (bβ, Const))
     end
 
-    # Test with a const output and active α and β
-    (_,_,_,dα, dβ), = autodiff(Reverse, LinearAlgebra.mul!, Const, Const(C), Const(M), Const(v), Active(α), Active(β))
-    @test dα ≈ 0
-    @test dβ ≈ 0
-
+    test_reverse(LinearAlgebra.mul!, Const, (C, Const), (M, Const), (v, Const), (α, Active), (β, Active))
 end
 
+@testset "SparseArrays spmatvec reverse rule" begin
+    Ts = ComplexF64
+
+    M0 = [0.0   1.50614;
+          0.0  -0.988357;
+          0.0   0.0]
+
+
+    M = SparseMatrixCSC((M0 .+ 2im*M0))
+    v = rand(Ts, 2)
+    α = rand(Ts)
+    β = rand(Ts)
+
+    # Purely complex
+    test_sparse(M, v, α, β)
+
+    # Purely real
+    test_sparse(real(M), real(v), real(α), real(β))
+
+    # Now test mixed. We only need to test what the variables are active
+    C = zeros(ComplexF64, size(M0, 1))
+    TB = (Duplicated, BatchDuplicated)
+    for T in TB
+        test_reverse(LinearAlgebra.mul!, T, (C, T), (real(M), T), (v, T), (α, Active), (β, Active))
+        test_reverse(LinearAlgebra.mul!, T, (C, T), (M, T), (real(v), T), (α, Active), (β, Active))
+        test_reverse(LinearAlgebra.mul!, T, (C, T), (real(M), T), (real(v), T), (α, Active), (β, Active))
+        test_reverse(LinearAlgebra.mul!, T, (C, T), (M, T), (v, T), (real(α), Active), (β, Active))
+        test_reverse(LinearAlgebra.mul!, T, (C, T), (real(M), T), (v, T), (real(α), Active), (β, Active))
+        test_reverse(LinearAlgebra.mul!, T, (C, T), (M, T), (real(v), T), (real(α), Active), (β, Active))
+        test_reverse(LinearAlgebra.mul!, T, (C, T), (real(M), T), (real(v), T), (real(α), Active), (β, Active))
+        test_reverse(LinearAlgebra.mul!, T, (C, T), (M, T), (v, T), (α, Active), (real(β), Active))
+    end
+end
+
+
 @testset "SparseArrays spmatmat reverse rule" begin
-    C = zeros(18, 11)
-    M = sprand(18, 9, 0.1)
-    v = randn(9, 11)
-    α = 2.0
-    β = 1.0
+    Ts = ComplexF64
 
-    for Tret in (Duplicated, BatchDuplicated), TM in (Const, Duplicated, BatchDuplicated), Tv in (Const, Duplicated, BatchDuplicated), 
-        Tα in (Const, Active), Tβ in (Const, Active)
-
-        are_activities_compatible(Tret, Tret, TM, Tv, Tα, Tβ) || continue
-        test_reverse(LinearAlgebra.mul!, Tret, (C, Tret), (M, TM), (v, Tv), (α, Tα), (β, Tβ))
-
-    end
+    M0 = [0.0   1.50614;
+          0.0  -0.988357;
+          0.0   0.0]
 
 
-    for Tret in (Duplicated, BatchDuplicated), TM in (Const, Duplicated, BatchDuplicated), 
-        Tv in (Const, Duplicated, BatchDuplicated), bα in (true, false), bβ in (true, false)
-        are_activities_compatible(Tret, Tret, TM, Tv) || continue
-        test_reverse(LinearAlgebra.mul!, Tret, (C, Tret), (M, Const), (v, Tv), (bα, Const), (bβ, Const))
-    end
+    M = SparseMatrixCSC((M0 .+ 2im*M0))
+    v = rand(Ts, 2, 2)
+    α = rand(Ts)
+    β = rand(Ts)
 
-    # Test with a const output and active α and β
-    (_,_,_,dα, dβ), = autodiff(Reverse, LinearAlgebra.mul!, Const, Const(C), Const(M), Const(v), Active(α), Active(β))
-    @test dα ≈ 0
-    @test dβ ≈ 0
+    # Now all the code paths are already tested in the vector case so we just make sure that 
+    # general matrix multiplication works
+    test_sparse(M, v, α, β)
 
 end
 

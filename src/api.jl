@@ -256,6 +256,7 @@ function EnzymeCreatePrimalAndGradient(
     dretUsed,
     mode,
     runtimeActivity,
+    strongZero,
     width,
     additionalArg,
     forceAnonymousTape,
@@ -265,6 +266,7 @@ function EnzymeCreatePrimalAndGradient(
     atomicAdd,
 )
     freeMemory = true
+    subsequent_calls_may_write = mode != DEM_ReverseModeCombined
     ccall(
         (:EnzymeCreatePrimalAndGradient, libEnzyme),
         LLVMValueRef,
@@ -281,11 +283,13 @@ function EnzymeCreatePrimalAndGradient(
             UInt8,
             CDerivativeMode,
             UInt8,
+            UInt8,
             Cuint,
             UInt8,
             LLVMTypeRef,
             UInt8,
             CFnTypeInfo,
+            UInt8,
             Ptr{UInt8},
             Csize_t,
             EnzymeAugmentedReturnPtr,
@@ -303,11 +307,13 @@ function EnzymeCreatePrimalAndGradient(
         dretUsed,
         mode,
         runtimeActivity,
+        strongZero,
         width,
         freeMemory,
         additionalArg,
         forceAnonymousTape,
         typeInfo,
+        subsequent_calls_may_write,
         uncacheable_args,
         length(uncacheable_args),
         augmented,
@@ -324,6 +330,7 @@ function EnzymeCreateForwardDiff(
     returnValue,
     mode,
     runtimeActivity,
+    strongZero,
     width,
     additionalArg,
     typeInfo,
@@ -331,6 +338,7 @@ function EnzymeCreateForwardDiff(
 )
     freeMemory = true
     aug = C_NULL
+    subsequent_calls_may_write = false
     ccall(
         (:EnzymeCreateForwardDiff, libEnzyme),
         LLVMValueRef,
@@ -347,9 +355,11 @@ function EnzymeCreateForwardDiff(
             CDerivativeMode,
             UInt8,
             UInt8,
+            UInt8,
             Cuint,
             LLVMTypeRef,
             CFnTypeInfo,
+            UInt8,
             Ptr{UInt8},
             Csize_t,
             EnzymeAugmentedReturnPtr,
@@ -366,9 +376,11 @@ function EnzymeCreateForwardDiff(
         mode,
         freeMemory,
         runtimeActivity,
+        strongZero,
         width,
         additionalArg,
         typeInfo,
+        subsequent_calls_may_write,
         uncacheable_args,
         length(uncacheable_args),
         aug,
@@ -398,9 +410,11 @@ function EnzymeCreateAugmentedPrimal(
     uncacheable_args,
     forceAnonymousTape,
     runtimeActivity,
+    strongZero,
     width,
     atomicAdd,
 )
+    subsequent_calls_may_write = true
     ccall(
         (:EnzymeCreateAugmentedPrimal, libEnzyme),
         EnzymeAugmentedReturnPtr,
@@ -416,8 +430,10 @@ function EnzymeCreateAugmentedPrimal(
             UInt8,
             UInt8,
             CFnTypeInfo,
+            UInt8,
             Ptr{UInt8},
             Csize_t,
+            UInt8,
             UInt8,
             UInt8,
             Cuint,
@@ -434,10 +450,12 @@ function EnzymeCreateAugmentedPrimal(
         returnUsed,
         shadowReturnUsed,
         typeInfo,
+        subsequent_calls_may_write,
         uncacheable_args,
         length(uncacheable_args),
         forceAnonymousTape,
         runtimeActivity,
+        strongZero,
         width,
         atomicAdd,
     )
@@ -600,6 +618,13 @@ EnzymeGradientUtilsGetWidth(gutils) = ccall(
 EnzymeGradientUtilsGetRuntimeActivity(gutils) =
     ccall(
         (:EnzymeGradientUtilsGetRuntimeActivity, libEnzyme),
+        UInt8,
+        (EnzymeGradientUtilsRef,),
+        gutils,
+    ) != 0
+EnzymeGradientUtilsGetStrongZero(gutils) =
+    ccall(
+        (:EnzymeGradientUtilsGetStrongZero, libEnzyme),
         UInt8,
         (EnzymeGradientUtilsRef,),
         gutils,
@@ -829,6 +854,43 @@ EnzymeGradientUtilsSubTransferHelper(
     MTI,
     allowForward,
     shadowsLookedUp,
+)
+
+EnzymeGradientUtilsAddReverseBlock(
+    gutils,
+    block,
+    name,
+    forkCache,
+    push
+) = ccall(
+    (:EnzymeGradientUtilsAddReverseBlock, libEnzyme),
+    LLVM.API.LLVMBasicBlockRef,
+    (
+        EnzymeGradientUtilsRef,
+        LLVM.API.LLVMBasicBlockRef,
+        Cstring,
+        UInt8,
+        UInt8,
+    ),
+    gutils,
+    block,
+    name,
+    forkCache,
+    push
+)
+
+EnzymeGradientUtilsSetReverseBlock(
+    gutils,
+    block,
+) = ccall(
+    (:EnzymeGradientUtilsSetReverseBlock, libEnzyme),
+    LLVM.API.LLVMBasicBlockRef,
+    (
+        EnzymeGradientUtilsRef,
+        LLVM.API.LLVMBasicBlockRef,
+    ),
+    gutils,
+    block,
 )
 
 EnzymeGradientUtilsCallWithInvertedBundles(
@@ -1190,18 +1252,6 @@ function fast_math!(val)
 end
 
 """
-    strong_zero!(val::Bool)
-
-Whether to enforce multiplication by zero as enforcing a zero result even if multiplying
-against a NaN or infinity. Necessary for some programs in which a value has a zero
-derivative since it is unused, even if it has an otherwise infinite or nan derivative.
-"""
-function strong_zero!(val)
-    ptr = cglobal((:EnzymeStrongZero, libEnzyme))
-    ccall((:EnzymeSetCLInteger, libEnzyme), Cvoid, (Ptr{Cvoid}, UInt8), ptr, val)
-end
-
-"""
     typeWarning!(val::Bool)
 
 Whether to print a warning when Type Analysis learns informatoin about a value's type
@@ -1235,6 +1285,11 @@ Off by default.
 function memmove_warning!(val)
     ptr = cglobal((:EnzymeMemmoveWarning, libEnzyme))
     ccall((:EnzymeSetCLBool, libEnzyme), Cvoid, (Ptr{Cvoid}, UInt8), ptr, val)
+end
+
+function EnzymeNonPower2Cache!(val)
+    ptr = cglobal((:EnzymeNonPower2Cache, libEnzyme))
+    ccall((:EnzymeSetCLInteger, libEnzyme), Cvoid, (Ptr{Cvoid}, UInt8), ptr, val)
 end
 
 function EnzymeRemoveTrivialAtomicIncrements(func)
@@ -1409,6 +1464,15 @@ end
 function EnzymeReplaceFunctionImplementation(mod)
     ccall(
         (:EnzymeReplaceFunctionImplementation, libEnzyme),
+        Cvoid,
+        (LLVM.API.LLVMModuleRef,),
+        mod,
+    )
+end
+
+function EnzymeDetectReadonlyOrThrow(mod)
+    ccall(
+        (:EnzymeDetectReadonlyOrThrow, libEnzyme),
         Cvoid,
         (LLVM.API.LLVMModuleRef,),
         mod,

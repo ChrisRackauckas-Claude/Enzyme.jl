@@ -50,9 +50,14 @@ import EnzymeCore:
     set_abi,
     set_runtime_activity,
     clear_runtime_activity,
+    set_strong_zero,
+    clear_strong_zero,
     within_autodiff,
     WithPrimal,
-    NoPrimal
+    NoPrimal,
+    needs_primal,
+    runtime_activity,
+    strong_zero
 export Annotation,
     Const,
     Active,
@@ -69,9 +74,14 @@ export Annotation,
     set_abi,
     set_runtime_activity,
     clear_runtime_activity,
+    set_strong_zero,
+    clear_strong_zero,
     WithPrimal,
     NoPrimal,
-    within_autodiff
+    within_autodiff,
+    needs_primal,
+    runtime_activity,
+    strong_zero
 
 import EnzymeCore: BatchDuplicatedFunc
 export BatchDuplicatedFunc
@@ -89,17 +99,19 @@ import EnzymeCore:
     autodiff_deferred_thunk,
     tape_type,
     make_zero,
-    make_zero!
+    make_zero!,
+    remake_zero!
 export autodiff,
     autodiff_deferred,
     autodiff_thunk,
     autodiff_deferred_thunk,
     tape_type,
     make_zero,
-    make_zero!
+    make_zero!,
+    remake_zero!
 
 export jacobian, gradient, gradient!, hvp, hvp!, hvp_and_gradient!
-export markType, batch_size, onehot, chunkedonehot
+export batch_size, onehot, chunkedonehot
 
 using LinearAlgebra
 import SparseArrays
@@ -130,10 +142,7 @@ include("internal_rules.jl")
 import .Compiler: CompilationException
 
 @inline function falses_from_args(N)
-    ntuple(Val(N)) do i
-        Base.@_inline_meta
-        false
-    end
+    ntuple(Returns(false), Val(N))
 end
 
 @inline function any_active(args::Vararg{Annotation,N}) where {N}
@@ -342,15 +351,16 @@ Enzyme.autodiff(ReverseWithPrimal, x->x*x, Active(3.0))
     point values, but cannot do so for integer values in tuples and structs.
 """
 @inline function autodiff(
-    mode::ReverseMode{ReturnPrimal,RuntimeActivity,RABI,Holomorphic,ErrIfFuncWritten},
+    mode::ReverseMode{ReturnPrimal,RuntimeActivity,StrongZero,RABI,Holomorphic,ErrIfFuncWritten},
     f::FA,
-    ::Type{A},
+    ::Type{A0},
     args::Vararg{Annotation,Nargs},
 ) where {
     FA<:Annotation,
-    A<:Annotation,
+    A0<:Annotation,
     ReturnPrimal,
     RuntimeActivity,
+    StrongZero,
     RABI<:ABI,
     Holomorphic,
     Nargs,
@@ -369,19 +379,21 @@ Enzyme.autodiff(ReverseWithPrimal, x->x*x, Active(3.0))
 
     FTy = Core.Typeof(f.val)
 
-    rt = if A isa UnionAll
-        Compiler.primal_return_type(mode, FTy, tt)
+    rt, A = if A0 isa UnionAll
+        rt0 = Compiler.primal_return_type(Reverse, FTy, tt)
+        rt0, A0{rt0}
     else
-        eltype(A)
+        eltype(A0), A0
     end
 
-    if A <: Active
+    if A0 <: Active
         if (!allocatedinline(rt) || rt isa Union) && rt != Union{}
             forward, adjoint = autodiff_thunk(
                 ReverseModeSplit{
                     ReturnPrimal,
                     #=ReturnShadow=#false,
                     RuntimeActivity,
+                    StrongZero,
                     width,
                     ModifiedBetweenT,
                     RABI,
@@ -401,21 +413,21 @@ Enzyme.autodiff(ReverseWithPrimal, x->x*x, Active(3.0))
                 return adjoint(f, args..., tape)
             end
         end
-    elseif A <: Duplicated ||
-           A <: DuplicatedNoNeed ||
-           A <: BatchDuplicated ||
-           A <: BatchDuplicatedNoNeed ||
-           A <: BatchDuplicatedFunc
+    elseif A0 <: Duplicated ||
+           A0 <: DuplicatedNoNeed ||
+           A0 <: BatchDuplicated ||
+           A0 <: BatchDuplicatedNoNeed ||
+           A0 <: BatchDuplicatedFunc
         throw(ErrorException("Duplicated Returns not yet handled"))
     end
 
     opt_mi = if RABI <: NonGenABI
-        Compiler.fspec(eltype(FA), tt′)
+        my_methodinstance(Reverse, eltype(FA), tt)
     else
         Val(0)
     end
 
-    if (A <: Active && rt <: Complex) && rt != Union{}
+    if (A0 <: Active && rt <: Complex) && rt != Union{}
         if Holomorphic
             seen = IdDict()
             seen2 = IdDict()
@@ -456,6 +468,7 @@ Enzyme.autodiff(ReverseWithPrimal, x->x*x, Active(3.0))
                 RABI,
                 Val(ErrIfFuncWritten),
                 Val(RuntimeActivity),
+                Val(StrongZero)
             ) #=ShadowInit=#
 
             results = thunk(f, args..., (rt(0), rt(1), rt(im)))
@@ -495,9 +508,10 @@ Enzyme.autodiff(ReverseWithPrimal, x->x*x, Active(3.0))
         RABI,
         Val(ErrIfFuncWritten),
         Val(RuntimeActivity),
+        Val(StrongZero)
     ) #=ShadowInit=#
 
-    if A <: Active
+    if A0 <: Active
         args = (args..., Compiler.default_adjoint(rt))
     end
     thunk(f, args...)
@@ -536,7 +550,7 @@ Like [`autodiff`](@ref) but will try to guess the activity of the return value.
 ) where {FA<:Annotation,CMode<:Mode,Nargs}
     tt = vaEltypeof(args...)
     rt = Compiler.primal_return_type(
-        mode,
+        mode isa ForwardMode ? Forward : Reverse,
         eltype(FA),
         tt,
     )
@@ -585,14 +599,14 @@ f(x) = x*x
 ```
 """
 @inline function autodiff(
-    mode::ForwardMode{ReturnPrimal,RABI,ErrIfFuncWritten,RuntimeActivity},
+    mode::ForwardMode{ReturnPrimal,RABI,ErrIfFuncWritten,RuntimeActivity,StrongZero},
     f::FA,
     ::Type{A},
     args::Vararg{Annotation,Nargs},
 ) where {
     FA<:Annotation,
     A<:Annotation,
-} where {ReturnPrimal,RABI<:ABI,Nargs,ErrIfFuncWritten,RuntimeActivity}
+} where {ReturnPrimal,RABI<:ABI,Nargs,ErrIfFuncWritten,RuntimeActivity,StrongZero}
     if any_active(args...)
         throw(ErrorException("Active arguments not allowed in forward mode"))
     end
@@ -632,7 +646,7 @@ f(x) = x*x
     tt = vaEltypeof(args...)
 
     opt_mi = if RABI <: NonGenABI
-        Compiler.fspec(eltype(FA), tt′)
+        my_methodinstance(Forward, eltype(FA), tt)
     else
         Val(0)
     end
@@ -650,6 +664,7 @@ f(x) = x*x
         RABI,
         Val(ErrIfFuncWritten),
         Val(RuntimeActivity),
+        Val(StrongZero)
     ) #=ShadowInit=#
     thunk(f, args...)
 end
@@ -661,7 +676,7 @@ Same as [`autodiff`](@ref) but uses deferred compilation to support usage in GPU
 code, as well as high-order differentiation.
 """
 @inline function autodiff_deferred(
-    mode::ReverseMode{ReturnPrimal,RuntimeActivity,RABI,Holomorphic,ErrIfFuncWritten},
+    mode::ReverseMode{ReturnPrimal,RuntimeActivity,StrongZero,RABI,Holomorphic,ErrIfFuncWritten},
     f::FA,
     ::Type{A},
     args::Vararg{Annotation,Nargs},
@@ -674,6 +689,7 @@ code, as well as high-order differentiation.
     Holomorphic,
     ErrIfFuncWritten,
     RuntimeActivity,
+    StrongZero
 }
     tt′ = vaTypeof(args...)
     width = same_or_one(1, args...)
@@ -687,10 +703,10 @@ code, as well as high-order differentiation.
     A2 = A
 
     if A isa UnionAll
-        rt = Compiler.primal_return_type(mode, FTy, tt)
+        rt = Compiler.primal_return_type(Reverse, FTy, tt)
         A2 = A{rt}
         if rt == Union{}
-            rt = Nothing 
+            rt = Nothing
         end
     else
         @assert A isa DataType
@@ -710,6 +726,7 @@ code, as well as high-order differentiation.
                     ReturnPrimal,
                     #=ReturnShadow=#false,
                     RuntimeActivity,
+                    StrongZero,
                     width,
                     ModifiedBetweenT,
                     RABI,
@@ -770,6 +787,7 @@ code, as well as high-order differentiation.
         UnknownTapeType,
         Val(ErrIfFuncWritten),
         Val(RuntimeActivity),
+        Val(StrongZero)
     ) #=ShadowInit=#
 
     thunk =
@@ -792,7 +810,7 @@ Same as `autodiff(::ForwardMode, f, Activity, args...)` but uses deferred compil
 code, as well as high-order differentiation.
 """
 @inline function autodiff_deferred(
-    mode::ForwardMode{ReturnPrimal,RABI,ErrIfFuncWritten,RuntimeActivity},
+    mode::ForwardMode{ReturnPrimal,RABI,ErrIfFuncWritten,RuntimeActivity,StrongZero},
     f::FA,
     ::Type{A},
     args::Vararg{Annotation,Nargs},
@@ -804,6 +822,7 @@ code, as well as high-order differentiation.
     RABI<:ABI,
     ErrIfFuncWritten,
     RuntimeActivity,
+    StrongZero
 }
     if any_active(args...)
         throw(ErrorException("Active arguments not allowed in forward mode"))
@@ -840,7 +859,7 @@ code, as well as high-order differentiation.
     FT = Core.Typeof(f.val)
 
     if RT isa UnionAll
-        rt = Compiler.primal_return_type(mode, FT, tt)
+        rt = Compiler.primal_return_type(Forward, FT, tt)
 	if rt == Union{}
 	   rt = Nothing
 	end
@@ -872,6 +891,7 @@ code, as well as high-order differentiation.
         UnknownTapeType,
         Val(ErrIfFuncWritten),
         Val(RuntimeActivity),
+        Val(StrongZero)
     ) #=ShadowInit=#
     thunk = Compiler.ForwardModeThunk{Ptr{Cvoid},FA,rt,tt′,width,ReturnPrimal}(adjoint_ptr)
     thunk(f, args...)
@@ -913,7 +933,7 @@ forward, reverse = autodiff_thunk(ReverseSplitWithPrimal, Const{typeof(f)}, Acti
 tape, result, shadow_result  = forward(Const(f), Duplicated(A, ∂A), Active(v))
 _, ∂v = reverse(Const(f), Duplicated(A, ∂A), Active(v), 1.0, tape)[1]
 
-result, ∂v, ∂A 
+result, ∂v, ∂A
 
 # output
 
@@ -925,6 +945,7 @@ result, ∂v, ∂A
         ReturnPrimal,
         ReturnShadow,
         RuntimeActivity,
+        StrongZero,
         Width,
         ModifiedBetweenT,
         RABI,
@@ -947,6 +968,7 @@ result, ∂v, ∂A
     ErrIfFuncWritten,
     ShadowInit,
     RuntimeActivity,
+    StrongZero
 }
     width = if Width == 0
         w = same_or_one(1, args...)
@@ -968,7 +990,7 @@ result, ∂v, ∂A
 
     tt′ = Tuple{args...}
     opt_mi = if RABI <: NonGenABI
-        Compiler.fspec(eltype(FA), tt′)
+        my_methodinstance(Reverse, eltype(FA), tt)
     else
         Val(0)
     end
@@ -985,6 +1007,7 @@ result, ∂v, ∂A
         RABI,
         Val(ErrIfFuncWritten),
         Val(RuntimeActivity),
+        Val(StrongZero)
     ) #=ShadowInit=#
 end
 
@@ -1028,8 +1051,8 @@ ftype when called with args of type `argtypes`.
 `Activity` is the Activity of the return value, it may be `Const` or `Duplicated`
 (or its variants `DuplicatedNoNeed`, `BatchDuplicated`, and`BatchDuplicatedNoNeed`).
 
-The forward function will return the primal (if requested) and the shadow
-(or nothing if not a `Duplicated` variant).
+The forward function will return the shadow (or nothing if not a `Duplicated` variant)
+and the primal (if requested).
 
 Example returning both the return derivative and original return:
 
@@ -1040,7 +1063,7 @@ c = 55; d = 9
 
 f(x) = x*x
 forward = autodiff_thunk(ForwardWithPrimal, Const{typeof(f)}, Duplicated, Duplicated{Float64})
-res, ∂f_∂x = forward(Const(f), Duplicated(3.14, 1.0))
+∂f_∂x, res = forward(Const(f), Duplicated(3.14, 1.0))
 
 # output
 
@@ -1056,7 +1079,7 @@ c = 55; d = 9
 
 f(x) = x*x
 forward = autodiff_thunk(Forward, Const{typeof(f)}, Duplicated, Duplicated{Float64})
-∂f_∂x = forward(Const(f), Duplicated(3.14, 1.0))
+∂f_∂x, = forward(Const(f), Duplicated(3.14, 1.0))
 
 # output
 
@@ -1064,7 +1087,7 @@ forward = autodiff_thunk(Forward, Const{typeof(f)}, Duplicated, Duplicated{Float
 ```
 """
 @inline function autodiff_thunk(
-    mode::ForwardMode{ReturnPrimal,RABI,ErrIfFuncWritten,RuntimeActivity},
+    mode::ForwardMode{ReturnPrimal,RABI,ErrIfFuncWritten,RuntimeActivity,StrongZero},
     ::Type{FA},
     ::Type{A},
     args::Vararg{Type{<:Annotation},Nargs},
@@ -1076,6 +1099,7 @@ forward = autodiff_thunk(Forward, Const{typeof(f)}, Duplicated, Duplicated{Float
     Nargs,
     ErrIfFuncWritten,
     RuntimeActivity,
+    StrongZero
 }
     width = same_or_one(1, A, args...)
     if width == 0
@@ -1098,7 +1122,7 @@ forward = autodiff_thunk(Forward, Const{typeof(f)}, Duplicated, Duplicated{Float
 
     tt′ = Tuple{args...}
     opt_mi = if RABI <: NonGenABI
-        Compiler.fspec(eltype(FA), tt′)
+        my_methodinstance(Forward, eltype(FA), tt)
     else
         Val(0)
     end
@@ -1115,6 +1139,7 @@ forward = autodiff_thunk(Forward, Const{typeof(f)}, Duplicated, Duplicated{Float
         RABI,
         Val(ErrIfFuncWritten),
         Val(RuntimeActivity),
+        Val(StrongZero)
     ) #=ShadowInit=#
 end
 
@@ -1123,6 +1148,7 @@ end
         ReturnPrimal,
         ReturnShadow,
         RuntimeActivity,
+        StrongZero,
         Width,
         ModifiedBetweenT,
         RABI,
@@ -1144,6 +1170,7 @@ end
     Nargs,
     ErrIfFuncWritten,
     RuntimeActivity,
+    StrongZero,
     ShadowInit,
 }
     width = if Width == 0
@@ -1166,7 +1193,7 @@ end
 
     primal_tt = Tuple{map(eltype, args)...}
     opt_mi = if RABI <: NonGenABI
-        Compiler.fspec(eltype(FA), TT)
+        my_methodinstance(Forward, eltype(FA), primal_tt)
     else
         Val(0)
     end
@@ -1183,7 +1210,8 @@ end
         RABI,
         Val(ErrIfFuncWritten),
         Val(RuntimeActivity),
-    ) #=ShadowInit=#
+        Val(StrongZero)
+    )
     if nondef[1] isa Enzyme.Compiler.PrimalErrorThunk
         return Nothing
     else
@@ -1196,7 +1224,7 @@ const tape_cache = Dict{UInt,Type}()
 
 const tape_cache_lock = ReentrantLock()
 
-import .Compiler: fspec, remove_innerty, UnknownTapeType
+import .Compiler: remove_innerty, UnknownTapeType
 
 @inline function tape_type(
     parent_job::Union{GPUCompiler.CompilerJob,Nothing},
@@ -1204,6 +1232,7 @@ import .Compiler: fspec, remove_innerty, UnknownTapeType
         ReturnPrimal,
         ReturnShadow,
         RuntimeActivity,
+        StrongZero,
         Width,
         ModifiedBetweenT,
         RABI,
@@ -1224,6 +1253,7 @@ import .Compiler: fspec, remove_innerty, UnknownTapeType
     RABI<:ABI,
     Nargs,
     RuntimeActivity,
+    StrongZero,
 }
     width = if Width == 0
         w = same_or_one(1, args...)
@@ -1246,7 +1276,7 @@ import .Compiler: fspec, remove_innerty, UnknownTapeType
 
     primal_tt = Tuple{map(eltype, args)...}
 
-    mi = Compiler.fspec(eltype(FA), TT)
+    mi = my_methodinstance(parent_job === nothing ? Reverse : GPUCompiler.get_interpreter(parent_job), eltype(FA), primal_tt)
 
     target = Compiler.EnzymeTarget()
     params = Compiler.EnzymeCompilerParams(
@@ -1263,7 +1293,14 @@ import .Compiler: fspec, remove_innerty, UnknownTapeType
         RABI,
         false, #=errifwritte=#
         RuntimeActivity,
+        StrongZero
     )
+
+    if parent_job !== nothing
+        target = GPUCompiler.nest_target(target, parent_job.config.target)
+        params = GPUCompiler.nest_params(params, parent_job.config.params)
+    end
+
     job = GPUCompiler.CompilerJob(mi, GPUCompiler.CompilerConfig(target, params; kernel = false))
 
 
@@ -1274,15 +1311,24 @@ import .Compiler: fspec, remove_innerty, UnknownTapeType
 
     try
         obj = get(tape_cache, key, nothing)
+        # If the tape is not cached, compile it
         if obj === nothing
 
-            Compiler.JuliaContext() do ctx
-                _, meta = Compiler.codegen(:llvm, job; optimize = false, parent_job)
+	    ts_ctx = Compiler.JuliaContext()
+	    ctx = Compiler.context(ts_ctx)
+	    Compiler.activate(ctx)
+            try
+                _, meta = GPUCompiler.compile(:llvm, job)
                 obj = meta.TapeType
                 tape_cache[key] = obj
+		obj
+    	    finally
+                Compiler.deactivate(ctx)
+		Compiler.dispose(ts_ctx)
             end
+	else
+	    obj
         end
-        obj
     finally
         unlock(tape_cache_lock)
     end
@@ -1325,7 +1371,7 @@ forward, reverse = autodiff_deferred_thunk(ReverseSplitWithPrimal, TapeType, Con
 tape, result, shadow_result  = forward(Const(f), Duplicated(A, ∂A), Active(v))
 _, ∂v = reverse(Const(f), Duplicated(A, ∂A), Active(v), 1.0, tape)[1]
 
-result, ∂v, ∂A 
+result, ∂v, ∂A
 
 # output
 
@@ -1337,6 +1383,7 @@ result, ∂v, ∂A
         ReturnPrimal,
         ReturnShadow,
         RuntimeActivity,
+        StrongZero,
         Width,
         ModifiedBetweenT,
         RABI,
@@ -1360,6 +1407,7 @@ result, ∂v, ∂A
     Nargs,
     ErrIfFuncWritten,
     RuntimeActivity,
+    StrongZero,
     ShadowInit
 }
     @assert RABI == FFIABI
@@ -1381,10 +1429,13 @@ result, ∂v, ∂A
 
     TT = Tuple{args...}
 
-    primal_tt = Tuple{map(eltype, args)...}
-    rt0 = Compiler.primal_return_type(mode, eltype(FA), primal_tt)
-
-    rt = Compiler.remove_innerty(A2){rt0}
+    rt = if A2 isa UnionAll
+        primal_tt = Tuple{map(eltype, args)...}
+	rt0 = Compiler.primal_return_type(Reverse, eltype(FA), primal_tt)
+	A2{rt0}
+    else
+	A2
+    end
 
     primal_ptr = Compiler.deferred_codegen(
         FA,
@@ -1398,6 +1449,7 @@ result, ∂v, ∂A
         TapeType,
         Val(ErrIfFuncWritten),
         Val(RuntimeActivity),
+        Val(StrongZero)
     ) #=ShadowInit=#
     adjoint_ptr = Compiler.deferred_codegen(
         FA,
@@ -1411,6 +1463,7 @@ result, ∂v, ∂A
         TapeType,
         Val(ErrIfFuncWritten),
         Val(RuntimeActivity),
+        Val(StrongZero)
     ) #=ShadowInit=#
 
     RT = if A2 <: Duplicated && width != 1
@@ -1443,78 +1496,6 @@ result, ∂v, ∂A
     aug_thunk, adj_thunk
 end
 
-# White lie, should be `Core.LLVMPtr{Cvoid, 0}` but that's not supported by ccallable
-Base.@ccallable function __enzyme_float(x::Ptr{Cvoid})::Cvoid
-    return nothing
-end
-
-Base.@ccallable function __enzyme_double(x::Ptr{Cvoid})::Cvoid
-    return nothing
-end
-
-@inline function markType(::Type{T}, ptr::Ptr{Cvoid}) where {T}
-    markType(Base.unsafe_convert(Ptr{T}, ptr))
-end
-
-@inline function markType(data::Array{T}) where {T}
-    GC.@preserve data markType(pointer(data))
-end
-
-# TODO(WM): We record the type of a single index here, we could give it a range
-@inline function markType(data::SubArray)
-    GC.@preserve data markType(pointer(data))
-end
-
-@inline function markType(data::Ptr{Float32})
-    @static if sizeof(Int) == sizeof(Int64)
-        Base.llvmcall(
-            (
-                "declare void @__enzyme_float(i8* nocapture) nounwind define void @c(i64 %q) nounwind alwaysinline { %p = inttoptr i64 %q to i8* call void @__enzyme_float(i8* %p) ret void }",
-                "c",
-            ),
-            Cvoid,
-            Tuple{Ptr{Float32}},
-            data,
-        )
-    else
-        Base.llvmcall(
-            (
-                "declare void @__enzyme_float(i8* nocapture) nounwind define void @c(i32 %q) nounwind alwaysinline { %p = inttoptr i32 %q to i8* call void @__enzyme_float(i8* %p) ret void }",
-                "c",
-            ),
-            Cvoid,
-            Tuple{Ptr{Float32}},
-            data,
-        )
-    end
-    nothing
-end
-
-@inline function markType(data::Ptr{Float64})
-    @static if sizeof(Int) == sizeof(Int64)
-        Base.llvmcall(
-            (
-                "declare void @__enzyme_double(i8* nocapture) nounwind define void @c(i64 %q) nounwind alwaysinline { %p = inttoptr i64 %q to i8* call void @__enzyme_double(i8* %p) ret void }",
-                "c",
-            ),
-            Cvoid,
-            Tuple{Ptr{Float64}},
-            data,
-        )
-    else
-        Base.llvmcall(
-            (
-                "declare void @__enzyme_double(i8* nocapture) nounwind define void @c(i32 %q) nounwind alwaysinline { %p = inttoptr i32 %q to i8* call void @__enzyme_double(i8* %p) ret void }",
-                "c",
-            ),
-            Cvoid,
-            Tuple{Ptr{Float64}},
-            data,
-        )
-    end
-    nothing
-end
-
 include("sugar.jl")
 
 function _import_frule end # defined in EnzymeChainRulesCoreExt extension
@@ -1522,7 +1503,7 @@ function _import_frule end # defined in EnzymeChainRulesCoreExt extension
 """
     import_frule(::fn, tys...)
 
-Automatically import a `ChainRulesCore.frule`` as a custom forward mode `EnzymeRule`. When called in batch mode, this
+Automatically import a `ChainRulesCore.frule` as a custom forward mode `EnzymeRule`. When called in batch mode, this
 will end up calling the primal multiple times, which may result in incorrect behavior if the function mutates,
 and slow code, always. Importing the rule from `ChainRules` is also likely to be slower than writing your own rule,
 and may also be slower than not having a rule at all.
@@ -1557,11 +1538,11 @@ function _import_rrule end # defined in EnzymeChainRulesCoreExt extension
 """
     import_rrule(::fn, tys...)
 
-Automatically import a ChainRules.rrule as a custom reverse mode EnzymeRule. When called in batch mode, this
+Automatically import a `ChainRules.rrule` as a custom reverse mode EnzymeRule. When called in batch mode, this
 will end up calling the primal multiple times which results in slower code. This macro assumes that the underlying
 function to be imported is read-only, and returns a Duplicated or Const object. This macro also assumes that the
-inputs permit a .+= operation and that the output has a valid Enzyme.make_zero function defined. It also assumes
-that overwritten(x) accurately describes if there is any non-preserved data from forward to reverse, not just
+inputs permit a `.+=` operation and that the output has a valid `Enzyme.make_zero` function defined. It also assumes
+that `overwritten(x)` accurately describes if there is any non-preserved data from forward to reverse, not just
 the outermost data structure being overwritten as provided by the specification.
 
 Finally, this macro falls back to almost always caching all of the inputs, even if it may not be needed for the
@@ -1579,13 +1560,6 @@ Enzyme.@import_rrule(typeof(Base.sort), Any);
 macro import_rrule(args...)
     return _import_rrule(args...)
 end
-
-"""
-   within_autodiff()
-
-Returns true if within autodiff, otherwise false.
-"""
-@inline EnzymeCore.within_autodiff() = false
 
 include("precompile.jl")
 

@@ -446,8 +446,6 @@ function jl_inst_simplify!(PM::LLVM.ModulePassManager)
     )
 end
 
-function post_attr!(mod::LLVM.Module) end
-
 cse!(pm) = LLVM.API.LLVMAddEarlyCSEPass(pm)
 
 function optimize!(mod::LLVM.Module, tm::LLVM.TargetMachine)
@@ -488,6 +486,8 @@ function optimize!(mod::LLVM.Module, tm::LLVM.TargetMachine)
         gvn!(pm) # Extra
         LLVM.run!(pm, mod)
     end
+
+    rewrite_generic_memory!(mod)
     
     ModulePassManager() do pm
         add_library_info!(pm, triple(mod))
@@ -652,6 +652,7 @@ function addOptimizationPasses!(pm::LLVM.ModulePassManager, tm::LLVM.TargetMachi
     jl_inst_simplify!(pm)
     jump_threading!(pm)
     dead_store_elimination!(pm)
+    add!(pm, FunctionPass("SafeAtomicToRegularStore", safe_atomic_to_regular_store!))
 
     # More dead allocation (store) deletion before loop optimization
     # consider removing this:
