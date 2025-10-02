@@ -1077,6 +1077,7 @@ function set_module_types!(interp, mod::LLVM.Module, primalf::Union{Nothing, LLV
         end
 
         world = enzyme_extract_world(f)
+        @assert world == interp.world
 
         if expectLen != length(parameters(f))
             continue
@@ -1659,6 +1660,7 @@ function shadow_alloc_rewrite(V::LLVM.API.LLVMValueRef, gutils::API.EnzymeGradie
        mode == API.DEM_ReverseModeCombined
         fn = LLVM.parent(LLVM.parent(V))
         world = enzyme_extract_world(fn)
+        @assert world == enzyme_gutils_context(gutils).world
         if !guaranteed_nonactive(Ty, world)
             B = LLVM.IRBuilder()
             position!(B, V)
