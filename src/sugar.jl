@@ -419,9 +419,23 @@ end
 @inline function chunkedonehot(x, ::Val{chunk}) where {chunk}
     sz = length(x)
     num = ((sz + chunk - 1) ÷ chunk)
-    ntuple(Val(num)) do i
-        Base.@_inline_meta
-        onehot(x, (i - 1) * chunk + 1, i == num ? sz : (i * chunk))
+    # Tracer scalar wrappers are not isbits and can provide scalar-free onehot methods.
+    if isbitstype(eltype(x))
+        return ntuple(Val(num)) do i
+            Base.@_inline_meta
+            onehot(x, (i - 1) * chunk + 1, i == num ? sz : (i * chunk))
+        end
+    else
+        shadows = onehot(x)
+        return ntuple(Val(num)) do i
+            Base.@_inline_meta
+            start = (i - 1) * chunk + 1
+            count = i == num ? sz - start + 1 : chunk
+            ntuple(Val(count)) do j
+                Base.@_inline_meta
+                shadows[start + j - 1]
+            end
+        end
     end
 end
 
